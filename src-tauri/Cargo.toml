@@ -1,0 +1,31 @@
+[package]
+name = "pidesk"
+version = "0.1.0"
+description = "PiDesk — Desktop UI for Pi Agent"
+authors = []
+edition = "2021"
+
+[lib]
+name = "pidesk_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+reqwest = { version = "0.12", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }

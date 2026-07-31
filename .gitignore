@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+pi-bundle/
+release/
+.vite/
+*.log
+.DS_Store
+Thumbs.db
