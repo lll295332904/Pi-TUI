@@ -41,8 +41,11 @@ fn decode_session_dir_name(dir_name: &str) -> String {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PiSessionMeta {
+    /// File-level ID: "dirname/filename", globally unique per .jsonl session file
     pub id: String,
     pub cwd: String,
+    /// Auto-generated from first user message (first 24 chars)
+    pub name: String,
     pub last_modified: u64,
     pub entry_count: usize,
 }
@@ -107,6 +110,67 @@ pub fn get_pi_version_cmd() -> Result<String, String> {
     crate::pi_locator::get_pi_version()
 }
 
+/// Extract session cwd and auto-generated name from a .jsonl file.
+/// Returns (cwd, name) where name is the first user message text truncated to 24 chars.
+fn extract_session_meta(jsonl_path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let content = match std::fs::read_to_string(jsonl_path) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+
+    let mut cwd: Option<String> = None;
+    let mut name: Option<String> = None;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Extract cwd from the first "session" entry
+        if cwd.is_none() && entry_type == "session" {
+            cwd = val.get("cwd").and_then(|v| v.as_str()).map(String::from);
+        }
+
+        // Extract name from the first user message
+        if name.is_none() && entry_type == "message" {
+            let msg = &val["message"];
+            if msg.get("role").and_then(|v| v.as_str()) == Some("user") {
+                if let Some(blocks) = msg.get("content").and_then(|v| v.as_array()) {
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                let trimmed = text.trim();
+                                let short: String = trimmed
+                                    .chars()
+                                    .take(24)
+                                    .collect();
+                                name = Some(if short.len() < trimmed.len() {
+                                    format!("{}…", short)
+                                } else {
+                                    short
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if cwd.is_some() && name.is_some() {
+            break;
+        }
+    }
+
+    (cwd, name)
+}
+
 #[tauri::command]
 pub fn list_pi_sessions() -> Result<Vec<PiSessionMeta>, String> {
     let sessions_dir = get_pi_sessions_dir();
@@ -128,7 +192,7 @@ pub fn list_pi_sessions() -> Result<Vec<PiSessionMeta>, String> {
         let dir_name = entry.file_name().to_string_lossy().to_string();
         let dir_path = entry.path();
 
-        // Read first JSONL file to extract cwd from session entry
+        // Get all .jsonl files in this directory — each is an independent session
         let mut jsonl_files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir_path)
             .map_err(|e| format!("Cannot read session dir: {}", e))?
             .filter_map(|e| e.ok())
@@ -142,173 +206,197 @@ pub fn list_pi_sessions() -> Result<Vec<PiSessionMeta>, String> {
 
         jsonl_files.sort();
 
-        let (cwd, entry_count) = {
-            let mut total = 0usize;
-            let mut found_cwd: Option<String> = None;
+        for file in &jsonl_files {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
 
-            for file in &jsonl_files {
-                if let Ok(content) = std::fs::read_to_string(file) {
-                    for line in content.lines() {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        total += 1;
-                        if found_cwd.is_none() {
-                            if let Ok(val) = serde_json::from_str::<Value>(line) {
-                                if val.get("type").and_then(|v| v.as_str()) == Some("session") {
-                                    found_cwd = val
-                                        .get("cwd")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Count entries and extract cwd + name
+            let (cwd, name) = extract_session_meta(file);
+            let entry_count = if let Ok(content) = std::fs::read_to_string(file) {
+                content.lines().filter(|l| !l.trim().is_empty()).count()
+            } else {
+                0
+            };
 
-            (
-                found_cwd.unwrap_or_else(|| decode_session_dir_name(&dir_name)),
-                total,
-            )
-        };
-
-        let last_modified = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        sessions.push(PiSessionMeta {
-            id: dir_name,
-            cwd,
-            last_modified,
-            entry_count,
-        });
-    }
-
-    // Filter out empty session directories (no entries = no actual conversation)
-    sessions.retain(|s| s.entry_count > 0);
-    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
-    Ok(sessions)
-}
-
-#[tauri::command]
-pub fn load_session_entries(session_dir: String) -> Result<Vec<SessionEntryVm>, String> {
-    let sessions_dir = get_pi_sessions_dir();
-    let dir_path = sessions_dir.join(&session_dir);
-
-    if !dir_path.exists() {
-        return Err(format!("Session directory not found: {}", dir_path.display()));
-    }
-
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir_path)
-        .map_err(|e| format!("Cannot read dir: {}", e))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map_or(false, |ext| ext == "jsonl")
-        })
-        .map(|e| e.path())
-        .collect();
-
-    files.sort();
-
-    let mut entries: Vec<SessionEntryVm> = Vec::new();
-
-    for file in &files {
-        let content =
-            std::fs::read_to_string(file).map_err(|e| format!("Cannot read file: {}", e))?;
-
-        for line in content.lines() {
-            if line.trim().is_empty() {
+            if entry_count == 0 {
                 continue;
             }
 
-            let val: Value =
-                serde_json::from_str(line).map_err(|e| format!("JSON parse error: {}", e))?;
+            let last_modified = file
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
 
-            let entry_type = val
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let id = val
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let parent_id = val
-                .get("parentId")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let timestamp = val
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            if entry_type != "message" {
-                continue;
-            }
-
-            let msg = &val["message"];
-            let role = msg
-                .get("role")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let content_blocks = &msg["content"];
-
-            let mut text = String::new();
-            let mut thinking = String::new();
-
-            if let Some(blocks) = content_blocks.as_array() {
-                for block in blocks {
-                    let block_type = block
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    text.push('\n');
-                                }
-                                text.push_str(t);
-                            }
-                        }
-                        "thinking" => {
-                            if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
-                                if !thinking.is_empty() {
-                                    thinking.push('\n');
-                                }
-                                thinking.push_str(t);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            entries.push(SessionEntryVm {
-                id,
-                entry_type,
-                parent_id,
-                role,
-                content: if text.is_empty() { None } else { Some(text) },
-                thinking: if thinking.is_empty() {
-                    None
-                } else {
-                    Some(thinking)
-                },
-                timestamp,
+            sessions.push(PiSessionMeta {
+                // File-level ID: "dirname/filename"
+                id: format!("{}/{}", dir_name, file_name),
+                cwd: cwd.unwrap_or_else(|| decode_session_dir_name(&dir_name)),
+                name: name.unwrap_or_else(|| "Untitled".to_string()),
+                last_modified,
+                entry_count,
             });
         }
     }
 
+    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(sessions)
+}
+
+/// Parse a file-level session ID ("dirname/filename") into its components.
+fn parse_session_file_id(session_id: &str) -> (&str, &str) {
+    session_id
+        .split_once('/')
+        .unwrap_or((session_id, ""))
+}
+
+#[tauri::command]
+pub fn load_session_entries(session_id: String) -> Result<Vec<SessionEntryVm>, String> {
+    let (dir_name, file_name) = parse_session_file_id(&session_id);
+    let sessions_dir = get_pi_sessions_dir();
+    let file_path = sessions_dir.join(dir_name).join(file_name);
+
+    if !file_path.exists() {
+        return Err(format!("Session file not found: {}", file_path.display()));
+    }
+
+    let content =
+        std::fs::read_to_string(&file_path).map_err(|e| format!("Cannot read file: {}", e))?;
+
+    let mut entries: Vec<SessionEntryVm> = Vec::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let val: Value =
+            serde_json::from_str(line).map_err(|e| format!("JSON parse error: {}", e))?;
+
+        let entry_type = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let parent_id = val
+            .get("parentId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let timestamp = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        if entry_type != "message" {
+            continue;
+        }
+
+        let msg = &val["message"];
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let content_blocks = &msg["content"];
+
+        let mut text = String::new();
+        let mut thinking = String::new();
+
+        if let Some(blocks) = content_blocks.as_array() {
+            for block in blocks {
+                let block_type = block
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match block_type {
+                    "text" => {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                            if !thinking.is_empty() {
+                                thinking.push('\n');
+                            }
+                            thinking.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        entries.push(SessionEntryVm {
+            id,
+            entry_type,
+            parent_id,
+            role,
+            content: if text.is_empty() { None } else { Some(text) },
+            thinking: if thinking.is_empty() {
+                None
+            } else {
+                Some(thinking)
+            },
+            timestamp,
+        });
+    }
+
     Ok(entries)
+}
+
+/// Delete a single .jsonl session file. Cleans up the directory if it becomes empty.
+#[tauri::command]
+pub fn delete_pi_session(session_id: String) -> Result<(), String> {
+    let (dir_name, file_name) = parse_session_file_id(&session_id);
+
+    if file_name.is_empty() {
+        return Err("Invalid session ID format".to_string());
+    }
+
+    let sessions_dir = get_pi_sessions_dir();
+    let file_path = sessions_dir.join(dir_name).join(file_name);
+
+    if file_path.exists() {
+        std::fs::remove_file(&file_path)
+            .map_err(|e| format!("Cannot delete session file: {}", e))?;
+    }
+
+    // Clean up directory if empty
+    let dir_path = sessions_dir.join(dir_name);
+    if dir_path.exists() {
+        if let Ok(mut read_dir) = std::fs::read_dir(&dir_path) {
+            if !read_dir.any(|e| {
+                e.ok()
+                    .map(|entry| {
+                        entry.path().extension().map_or(false, |ext| ext == "jsonl")
+                    })
+                    .unwrap_or(false)
+            }) {
+                let _ = std::fs::remove_dir(&dir_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the Pi sessions directory path (for constructing full file paths)
+#[tauri::command]
+pub fn get_sessions_dir() -> Result<String, String> {
+    let dir = get_pi_sessions_dir();
+    Ok(dir.to_string_lossy().to_string())
 }
 
 /// Check if a Pi session process is still alive

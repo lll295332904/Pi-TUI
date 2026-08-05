@@ -1,10 +1,11 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { usePiDeskStore } from "./store/pidesk";
 import {
   startSession, prompt as piPrompt, onPiEvent, abortSession, stopSession,
   listPiSessions, loadSessionEntries, getAvailableModels, deletePiSession,
   setModel, setThinkingLevel, setAutoCompaction, setAutoRetry,
   setSteeringMode, setFollowUpMode, checkPiHealth, loadUserdata,
+  getSessionsDir, switchSession, newPiSession, steer, saveUserdata,
 } from "./bridge";
 import type { PiRawAgentEvent, TimelineItem, MessageVM, ToolCallVM, PiOutboundEvent, SessionEntryVm, ExtensionUiRequest, RoleModels, ThinkingLevel } from "./types";
 import TopBar from "./components/TopBar";
@@ -19,6 +20,7 @@ import ConsolePanel from "./components/ConsolePanel";
 import ApprovalDialog from "./components/ApprovalDialog";
 import ErrorBoundary from "./components/ErrorBoundary";
 import ToastContainer from "./components/ToastContainer";
+import ShortcutsPanel from "./components/ShortcutsPanel";
 import { getT } from "./i18n";
 
 // Add this at the top of App() body after other hooks
@@ -84,6 +86,7 @@ export default function App() {
   // Guard against concurrent resume for the same cwd
   const resumingRef = useRef<Set<string>>(new Set());
   const prevStatusRef = useRef<Record<string, string>>({});
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   // ── Role-based model switching ──
 
@@ -147,8 +150,7 @@ export default function App() {
 
     if (ev.kind === "process-exit") {
       appendTimeline({ type: "system-info", text: "Pi process exited", timestamp: Date.now() });
-      const sid = usePiDeskStore.getState().activeSessionId;
-      if (sid) updateStatus(sid, "idle");
+      updateStatus(ev.sessionId, "idle");
       return;
     }
 
@@ -326,10 +328,47 @@ export default function App() {
         const s = usePiDeskStore.getState();
         if (data.projects) usePiDeskStore.setState({ projects: { ...s.projects, ...data.projects } } as Parameters<typeof usePiDeskStore.setState>[0]);
         if (data.pinned) usePiDeskStore.setState({ pinned: { ...s.pinned, ...data.pinned } } as Parameters<typeof usePiDeskStore.setState>[0]);
-        if (data.sessionNames) usePiDeskStore.setState({ sessionNames: { ...s.sessionNames, ...data.sessionNames } } as Parameters<typeof usePiDeskStore.setState>[0]);
         if (data.sessionWorkspaces) usePiDeskStore.setState({ sessionWorkspaces: { ...s.sessionWorkspaces, ...data.sessionWorkspaces } } as Parameters<typeof usePiDeskStore.setState>[0]);
         if (data.lastActiveCwd) {
           usePiDeskStore.setState({ lastActiveCwd: data.lastActiveCwd as string } as Parameters<typeof usePiDeskStore.setState>[0]);
+        }
+        // Load sessionNames: only keep fileId-keyed entries ("--C--Git--/file.jsonl")
+        // Discard old cwd-keyed entries (containing \ or :) and UUID-keyed orphans.
+        // Also purge entries with duplicate display names that are clearly migration pollution
+        // (3+ sessions sharing the identical name = old cwd-based migration artifact).
+        if (data.sessionNames) {
+          const raw = data.sessionNames as Record<string, string>;
+          const clean: Record<string, string> = {};
+          let hasJunk = false;
+          for (const [k, v] of Object.entries(raw)) {
+            if (k.startsWith("--") && k.includes("/") && k.endsWith(".jsonl")) {
+              clean[k] = v;
+            } else {
+              hasJunk = true;
+            }
+          }
+          // Detect migration pollution: count how many entries share each display name
+          const nameCounts = new Map<string, number>();
+          for (const v of Object.values(clean)) nameCounts.set(v, (nameCounts.get(v) ?? 0) + 1);
+          const pollutedNames = new Set([...nameCounts].filter(([, c]) => c >= 3).map(([n]) => n));
+          if (pollutedNames.size > 0) {
+            for (const [k, v] of Object.entries(clean)) {
+              if (pollutedNames.has(v)) { delete clean[k]; hasJunk = true; }
+            }
+          }
+          if (Object.keys(clean).length > 0) {
+            usePiDeskStore.setState({ sessionNames: { ...s.sessionNames, ...clean } } as Parameters<typeof usePiDeskStore.setState>[0]);
+          }
+          // Write cleaned data back to disk to purge old cwd/UUID keys + polluted duplicates
+          if (hasJunk) {
+            saveUserdata({
+              projects: data.projects || s.projects,
+              pinned: data.pinned || s.pinned,
+              sessionNames: clean,
+              sessionWorkspaces: data.sessionWorkspaces || s.sessionWorkspaces,
+              lastActiveCwd: data.lastActiveCwd || s.lastActiveCwd,
+            }).catch(() => {});
+          }
         }
         // Retroactively apply workspaceCwd to already-loaded sessions
         const current = usePiDeskStore.getState();
@@ -351,7 +390,9 @@ export default function App() {
 
   // Load historical sessions + available models on startup
   useEffect(() => {
-    listPiSessions().then(setHistoricalSessions).catch(console.error);
+    listPiSessions().then((list) => {
+      setHistoricalSessions(list);
+    }).catch(console.error);
     getAvailableModels().then(setAvailableModels).catch(console.error);
   }, [setHistoricalSessions, setAvailableModels]);
 
@@ -361,14 +402,19 @@ export default function App() {
     const lastCwd = usePiDeskStore.getState().lastActiveCwd;
     if (!lastCwd || hs.length === 0) return;
     const found = hs.find(h => h.cwd === lastCwd);
-    if (found && !usePiDeskStore.getState().sessions[found.id]) {
+    // sessions keyed by UUID, not fileId — use fileId matching
+    const alreadyActive = found
+      ? Object.values(usePiDeskStore.getState().sessions).some(s => s.fileId === found.id)
+      : false;
+    if (found && !alreadyActive) {
       handleResumeSession(found.id, found.cwd);
     }
   }, [usePiDeskStore((s) => s.historicalSessions.length), usePiDeskStore((s) => s.lastActiveCwd)]);
 
   // ── Apply settings to a new session ──
   const applySettingsToSession = useCallback(async (sessionId: string) => {
-    const settings = usePiDeskStore.getState().settings;
+    const state = usePiDeskStore.getState();
+    const settings = state.settings;
     // Apply default model
     if (settings.defaultModel) {
       try {
@@ -388,6 +434,13 @@ export default function App() {
       await setSteeringMode(sessionId, settings.steeringMode);
       await setFollowUpMode(sessionId, settings.followUpMode);
     } catch (e) { console.error("Failed to apply behavior settings:", e); }
+    // Apply response language preference (steer Pi to match UI language)
+    try {
+      const langMsg = state.language === "zh"
+        ? "请始终使用中文回复。"
+        : "Please always respond in English.";
+      await steer(sessionId, langMsg);
+    } catch (e) { console.error("Failed to apply language instruction:", e); }
   }, [updateSessionModel, updateSessionThinkingLevel]);
 
   // ── New session (fresh) ──
@@ -400,6 +453,12 @@ export default function App() {
         addProject(workspaceCwd, workspaceCwd.split("\\").pop() || workspaceCwd);
       }
       const id = await startSession({ cwd });
+      // Tell Pi to create a fresh session instead of auto-resuming the most recent
+      try {
+        await newPiSession(id);
+      } catch (e) {
+        console.error("Failed to create new Pi session:", e);
+      }
       const model = settings.defaultModel;
       setActiveSession(id, {
         id, name: "New Session", cwd,
@@ -409,6 +468,8 @@ export default function App() {
         status: "idle",
       });
       await applySettingsToSession(id);
+      // Persist last active cwd so session can be restored on restart
+      usePiDeskStore.getState().setLastActiveCwd(cwd);
     } catch (e) {
       console.error("Failed to start session:", e);
       usePiDeskStore.getState().addToast({
@@ -418,12 +479,12 @@ export default function App() {
         durationMs: 8000,
       });
     }
-  }, [setActiveSession, applySettingsToSession, addProject]);
+  }, [setActiveSession, applySettingsToSession, addProject, newPiSession]);
 
   // ── Resume historical session ──
   const handleResumeSession = useCallback(async (dirName: string, cwd: string) => {
-    // Idempotent: if this cwd is already active, just switch to it
-    const existing = Object.values(usePiDeskStore.getState().sessions).find((s) => s.cwd === cwd);
+    // Idempotent: if this session file is already active, just switch to it
+    const existing = Object.values(usePiDeskStore.getState().sessions).find((s) => s.fileId === dirName);
     if (existing) {
       setActiveSession(existing.id, existing);
       usePiDeskStore.getState().setLastActiveCwd(cwd);
@@ -439,18 +500,30 @@ export default function App() {
       const entries = await loadSessionEntries(dirName);
       const items = entriesToTimeline(entries);
 
-      // Start Pi with same cwd (Pi auto-resumes the session)
+      // Start Pi with same cwd (Pi auto-resumes the most recent session by default)
       const id = await startSession({ cwd });
 
-      // Use persisted custom name if available, else fall back to dir name
+      // Switch Pi to the specific session file the user clicked
+      try {
+        const sessionsDir = await getSessionsDir();
+        const fullPath = `${sessionsDir}/${dirName}`;
+        await switchSession(id, fullPath);
+      } catch (e) {
+        console.error("Failed to switch to session file:", e);
+      }
+
+      // Use persisted custom name if available, else fall back to name from session meta
       const settings = usePiDeskStore.getState().settings;
-      const customName = usePiDeskStore.getState().sessionNames[cwd];
-      const displayName = customName || cwd.split("\\").pop() || cwd;
+      const store = usePiDeskStore.getState();
+      const histSession = store.historicalSessions.find(h => h.id === dirName);
+      const customName = store.sessionNames[dirName];
+      const displayName = customName || histSession?.name || "Untitled";
 
       // Create session with history loaded — restore workspaceCwd from persistent mapping
       const workspaceCwd = usePiDeskStore.getState().sessionWorkspaces[cwd];
       setActiveSession(id, {
         id, name: displayName, cwd,
+        fileId: dirName,
         workspaceCwd,
         thinkingLevel: settings.defaultThinkingLevel,
         model: settings.defaultModel ? { provider: settings.defaultModel.provider, id: settings.defaultModel.id } : undefined,
@@ -462,10 +535,16 @@ export default function App() {
       await applySettingsToSession(id);
     } catch (e) {
       console.error("Failed to resume session:", e);
+      usePiDeskStore.getState().addToast({
+        type: "error",
+        title: "Resume Failed",
+        message: String(e).slice(0, 200),
+        durationMs: 8000,
+      });
     } finally {
       resumingRef.current.delete(cwd);
     }
-  }, [setActiveSession, loadHistoryEntries, applySettingsToSession]);
+  }, [setActiveSession, loadHistoryEntries, applySettingsToSession, getSessionsDir, switchSession]);
 
   // ── Send message ──
   const handleSend = useCallback(async (text: string, images?: string[]) => {
@@ -479,14 +558,22 @@ export default function App() {
       await switchToRole("vision");
     }
 
-    // Rename session from first user message
+    // Auto-name session from first user message (in-memory only, not persisted)
     const sess = usePiDeskStore.getState().sessions[activeId];
     if (sess && sess.name === "New Session") {
-      renameSession(activeId, text.slice(0, 24).trim() || "New Session");
+      const autoName = text.slice(0, 24).trim() || "New Session";
+      usePiDeskStore.setState((s) => ({
+        sessions: { ...s.sessions, [activeId]: { ...s.sessions[activeId], name: autoName } },
+      }));
     }
 
     clearInput();
-    await piPrompt(activeId, text);
+    try {
+      await piPrompt(activeId, text, images);
+    } catch (e) {
+      updateStatus(activeId, "idle");
+      appendTimeline({ type: "system-info", text: `Error: ${String(e)}`, timestamp: Date.now() });
+    }
   }, [activeId, appendTimeline, updateStatus, renameSession, clearInput]);
 
   const handleAbort = useCallback(async () => {
@@ -505,7 +592,10 @@ export default function App() {
     await stopSession(id);
     // Delete from disk
     if (session) {
-      try { await deletePiSession(session.cwd); } catch (e) { console.error("Delete disk session failed:", e); }
+      // Use persistent fileId if available (for resumed sessions), otherwise skip disk delete
+      if (session?.fileId) {
+        try { await deletePiSession(session.fileId); } catch (e) { console.error("Delete disk session failed:", e); }
+      }
     }
     if (store.activeSessionId === id) {
       const remaining = Object.keys(store.sessions).filter((k) => k !== id);
@@ -517,10 +607,11 @@ export default function App() {
     // Clean up pinned references
     usePiDeskStore.getState().togglePinSession(id); // removes if pinned
     // Also remove from historical list and sessionNames
-    setHistoricalSessions(usePiDeskStore.getState().historicalSessions.filter(h => h.cwd !== session?.cwd));
+    const persistId = session?.fileId || id;
+    setHistoricalSessions(usePiDeskStore.getState().historicalSessions.filter(h => h.id !== persistId));
     if (session?.cwd) {
       usePiDeskStore.setState((s) => {
-        const { [session.cwd]: _, ...restNames } = s.sessionNames;
+        const { [persistId]: _, ...restNames } = s.sessionNames;
         const { [session.cwd]: __, ...restWs } = s.sessionWorkspaces;
         return { sessionNames: restNames, sessionWorkspaces: restWs };
       });
@@ -537,7 +628,8 @@ export default function App() {
       if (mod && e.key === "b") { e.preventDefault(); usePiDeskStore.setState((s) => ({ sidebarOpen: !s.sidebarOpen })); return; }
       if (mod && e.key === "i") { e.preventDefault(); usePiDeskStore.setState((s) => ({ inspectorOpen: !s.inspectorOpen })); return; }
       if (mod && e.key === ",") { e.preventDefault(); usePiDeskStore.getState().setSettingsOpen(true); return; }
-      if (e.key === "Escape") { usePiDeskStore.getState().setSearchOpen(false); return; }
+      if (e.key === "Escape") { usePiDeskStore.getState().setSearchOpen(false); setShortcutsOpen(false); return; }
+      if ((mod && e.key === "/") || (!mod && e.key === "?")) { e.preventDefault(); setShortcutsOpen(v => !v); return; }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -595,6 +687,18 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // ── Broadcast language change to all active sessions ──
+  const language = usePiDeskStore((s) => s.language);
+  useEffect(() => {
+    const langMsg = language === "zh"
+      ? "请始终使用中文回复。"
+      : "Please always respond in English.";
+    const s = usePiDeskStore.getState();
+    for (const id of Object.keys(s.sessions)) {
+      steer(id, langMsg).catch(() => {});
+    }
+  }, [language]);
+
   return (
     <div className="h-screen flex flex-col bg-surface">
       <TopBar
@@ -611,8 +715,10 @@ export default function App() {
           />
         )}
         <div className="flex-1 flex flex-col min-w-0">
-          <Conversation />
-          <Composer onSend={handleSend} onAbort={handleAbort} />
+          <ErrorBoundary name="Conversation">
+            <Conversation />
+            <Composer onSend={handleSend} onAbort={handleAbort} />
+          </ErrorBoundary>
         </div>
         <ErrorBoundary name="Inspector">
           <InspectorPanel />
@@ -625,9 +731,12 @@ export default function App() {
       <ErrorBoundary name="Search">
         <SearchBar />
       </ErrorBoundary>
-      <SettingsPanel />
+      <ErrorBoundary name="Settings">
+        <SettingsPanel />
+      </ErrorBoundary>
       <ApprovalDialog />
       <ToastContainer />
+      <ShortcutsPanel open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </div>
   );
 }

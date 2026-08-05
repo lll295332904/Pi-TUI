@@ -3,11 +3,9 @@ import { usePiDeskStore } from "../store/pidesk";
 import { getAvailableModels, getThinkingLevels, setModel, setThinkingLevel, setSteeringMode, setFollowUpMode, setAutoCompaction, setAutoRetry, readPiFile, writePiFile, listPiFiles, addModel, removeModel, fetchModelsFromUrl } from "../bridge";
 import type { FetchedModel } from "../bridge";
 import type { AvailableModel, ThinkingLevel } from "../types";
-import { ROLE_LABELS, ROLE_ORDER, DISCONNECTED_ROLES } from "../types";
+import { ROLE_LABELS, ROLE_ORDER, DISCONNECTED_ROLES, THINKING_LEVELS } from "../types";
 import { useT } from "../i18n";
 import { X, Settings, Cpu, Zap, FileText, Save, PlusCircle, Layers, Wrench } from "lucide-react";
-
-const ALL_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export default function SettingsPanel() {
   const settingsOpen = usePiDeskStore((s) => s.settingsOpen);
@@ -22,13 +20,16 @@ export default function SettingsPanel() {
   const updateSessionModel = usePiDeskStore((s) => s.updateSessionModel);
   const updateSessionThinkingLevel = usePiDeskStore((s) => s.updateSessionThinkingLevel);
   const setRoleModel = usePiDeskStore((s) => s.setRoleModel);
+  const language = usePiDeskStore((s) => s.language);
+  const setLanguage = usePiDeskStore((s) => s.setLanguage);
 
   const [activeTab, setActiveTab] = useState<"model" | "behavior" | "add-model" | "config" | "mcp">("model");
-  const [thinkingLevels, setThinkingLevels] = useState<string[]>(ALL_THINKING_LEVELS as string[]);
+  const [thinkingLevels, setThinkingLevels] = useState<string[]>([...THINKING_LEVELS]);
   const [configFiles, setConfigFiles] = useState<string[]>([]);
   const [configContent, setConfigContent] = useState("");
   const [configFileName, setConfigFileName] = useState("");
   const [configDirty, setConfigDirty] = useState(false);
+  const [mcpServers, setMcpServers] = useState<Array<{ name: string; command: string; args: string }>>([]);
 
   // Add model form state
   const [addModelForm, setAddModelForm] = useState({
@@ -59,13 +60,32 @@ export default function SettingsPanel() {
     if (settings.defaultModel) {
       getThinkingLevels(settings.defaultModel.provider, settings.defaultModel.id)
         .then(setThinkingLevels)
-        .catch(() => setThinkingLevels(ALL_THINKING_LEVELS as string[]));
+        .catch(() => setThinkingLevels([...THINKING_LEVELS]));
     } else {
-      setThinkingLevels(ALL_THINKING_LEVELS as string[]);
+      setThinkingLevels([...THINKING_LEVELS]);
     }
   }, [settings.defaultModel]);
 
-  // Load config file list when config tab is opened
+  // Load MCP servers from Pi settings on tab open
+  const loadMcpServers = useCallback(async () => {
+    try {
+      const raw = await readPiFile("settings.json");
+      const settings = JSON.parse(raw);
+      const servers = settings.mcpServers || {};
+      const list = Object.entries(servers).map(([name, cfg]: [string, any]) => ({
+        name,
+        command: cfg.command || "",
+        args: (cfg.args || []).join(", "),
+      }));
+      setMcpServers(list);
+    } catch {
+      setMcpServers([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "mcp") loadMcpServers();
+  }, [activeTab, loadMcpServers]);
   useEffect(() => {
     if (activeTab === "config" && configFiles.length === 0) {
       listPiFiles().then(setConfigFiles).catch(console.error);
@@ -73,6 +93,23 @@ export default function SettingsPanel() {
   }, [activeTab, configFiles.length]);
 
   const session = activeId ? sessions[activeId] : null;
+
+  // 判断是否有未保存的工作（文件编辑脏 或 模型表单已填写）
+  const hasUnsavedWork = configDirty || !!(
+    addModelForm.provider.trim() ||
+    addModelForm.modelId.trim() ||
+    addModelForm.displayName.trim() ||
+    addModelForm.apiBaseUrl.trim()
+  );
+
+  /** 安全关闭：有未保存工作时弹出确认 */
+  const handleRequestClose = () => {
+    if (hasUnsavedWork) {
+      // eslint-disable-next-line no-alert
+      if (!confirm(st("closeConfirm"))) return;
+    }
+    setSettingsOpen(false);
+  };
 
   // ── Model change handler ──
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
@@ -222,7 +259,7 @@ export default function SettingsPanel() {
     : "";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setSettingsOpen(false)}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={handleRequestClose}>
       <div
         className="w-[640px] h-[560px] bg-white rounded-lg shadow-xl flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
@@ -235,15 +272,15 @@ export default function SettingsPanel() {
           </div>
           <div className="flex items-center gap-3">
             <select
-              value={usePiDeskStore.getState().language}
-              onChange={(e) => usePiDeskStore.getState().setLanguage(e.target.value as "zh" | "en")}
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as "zh" | "en")}
               className="text-xs border border-border rounded px-2 py-0.5 bg-white"
             >
               <option value="zh">中文</option>
               <option value="en">English</option>
             </select>
           </div>
-          <button onClick={() => setSettingsOpen(false)} className="text-gray-500 hover:text-gray-700">
+          <button onClick={handleRequestClose} className="text-gray-500 hover:text-gray-700">
             <X size={18} />
           </button>
         </div>
@@ -340,7 +377,7 @@ export default function SettingsPanel() {
               <div>
                 <label className="block text-xs font-medium text-gray-600 mb-1.5">{st("defaultThinking")}</label>
                 <div className="flex flex-wrap gap-1.5">
-                  {(thinkingLevels.length > 0 ? thinkingLevels : ALL_THINKING_LEVELS).map((level) => (
+                  {(thinkingLevels.length > 0 ? thinkingLevels : THINKING_LEVELS).map((level) => (
                     <button
                       key={level}
                       onClick={() => handleThinkingLevelChange(level)}
@@ -694,16 +731,20 @@ export default function SettingsPanel() {
               <div className="space-y-2">
                 <div className="text-xs font-medium text-gray-600">Configured Servers</div>
                 <div className="space-y-1">
-                  {([["filesystem", "local"], ["web-search", "remote"]] as [string, string][]).map(([name, type]) => (
-                    <div key={name} className="flex items-center gap-2 bg-gray-50 rounded px-2 py-1.5 text-xs">
-                      <span className={`w-1.5 h-1.5 rounded-full ${type === "local" ? "bg-green-500" : "bg-blue-500"}`} />
-                      <span className="font-mono text-gray-700 flex-1">{name}</span>
-                      <span className="text-muted">{type}</span>
+                  {mcpServers.length === 0 ? (
+                    <div className="text-xs text-muted italic py-2">No MCP servers configured. Add one below or edit settings.json directly.</div>
+                  ) : (
+                    mcpServers.map((srv) => (
+                    <div key={srv.name} className="flex items-center gap-2 bg-gray-50 rounded px-2 py-1.5 text-xs">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                      <span className="font-mono text-gray-700 flex-1">{srv.name}</span>
+                      <span className="text-muted truncate max-w-[120px]">{srv.command}{srv.args ? ` ${srv.args}` : ""}</span>
                       <button className="text-red-400 hover:text-red-600">
                         <X size={12} />
                       </button>
                     </div>
-                  ))}
+                  ))
+                  )}
                 </div>
               </div>
 

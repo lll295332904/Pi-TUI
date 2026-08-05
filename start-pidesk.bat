@@ -21,6 +21,5 @@ if errorlevel 1 (
 )
 
 echo [PiDesk] Starting PiDesk...
-set SAFE_DELETE_DISABLE=1
 npx tauri dev
 pause

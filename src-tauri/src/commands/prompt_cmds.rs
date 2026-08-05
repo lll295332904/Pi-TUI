@@ -215,6 +215,16 @@ pub async fn respond_extension_ui(
     })
 }
 
+// ── Session management ──
+
+#[tauri::command]
+pub async fn new_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    send_cmd!(state, session_id, PiRequest::NewSession)
+}
+
 // ── Session entries ──
 
 #[tauri::command]
@@ -510,44 +520,6 @@ pub fn remove_model(provider: String, model_id: String) -> Result<(), String> {
         .map_err(|e| format!("Serialize error: {}", e))?;
     std::fs::write(&models_path, &updated)
         .map_err(|e| format!("Cannot write: {}", e))
-}
-
-// ── Delete Pi session (disk) ──
-
-#[tauri::command]
-pub fn delete_pi_session(cwd: String) -> Result<(), String> {
-    let sessions_dir = get_pi_agent_dir().join("sessions");
-    if !sessions_dir.exists() { return Ok(()); }
-
-    let entries = std::fs::read_dir(&sessions_dir)
-        .map_err(|e| format!("Cannot read sessions dir: {}", e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Read error: {}", e))?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
-
-        // Read first JSONL to extract cwd
-        let dir_path = entry.path();
-        if let Ok(jsonl_entries) = std::fs::read_dir(&dir_path) {
-            for file in jsonl_entries.filter_map(|e| e.ok()) {
-                let path = file.path();
-                if path.extension().map_or(false, |e| e == "jsonl") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        for line in content.lines().take(3) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                                if v.get("cwd").and_then(|c| c.as_str()) == Some(&cwd) {
-                                    std::fs::remove_dir_all(&dir_path)
-                                        .map_err(|e| format!("Cannot delete: {}", e))?;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 // ── Fetch models from OpenAI-compatible API ──

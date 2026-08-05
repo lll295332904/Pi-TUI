@@ -1,21 +1,74 @@
-# PiDesk — PI Agent 桌面 UI 工具
+# PiDesk
 
-> 用一个原生桌面应用（Windows `.exe`）取代 PI Agent 的命令行 TUI，交互模式对标 Hermes TUI / Codex，但拥有更符合个人使用习惯的图形界面。
+PiDesk 是一个基于 **Tauri 2 + React + TypeScript** 的 Pi Agent 桌面客户端。它通过内置的 Pi runtime 启动 `dist/rpc-entry.js`，用 stdin/stdout JSONL 协议驱动 agent，并将事件流渲染为桌面 UI。
 
-本仓库当前阶段为 **制作方案（设计文档 + UI 原型）**，尚未开始编码实现。
+## 当前状态
 
-## 目录
+项目已经进入可运行实现阶段，不再是早期 Electron 方案/静态原型阶段。
 
-| 路径 | 内容 |
-|---|---|
-| `docs/01-方案总览.md` | 项目目标、调研结论、整体结论 |
-| `docs/02-技术方案.md` | 技术选型（决策矩阵）、系统架构、通信层设计、打包方案 |
-| `docs/03-UI界面说明.md` | 界面布局、各区域说明、交互与快捷键、审批流、参考对标 |
-| `docs/04-实施计划.md` | 目录结构、迭代里程碑、风险与对策 |
-| `prototype/index.html` | 可在浏览器直接打开的高保真界面原型（静态） |
+当前重点：
 
-## 一句话结论
+- Windows NSIS/MSI release 包构建
+- 内置 Pi runtime 打包
+- 多会话、历史恢复、模型配置、工具卡片、Inspector/Console 面板
+- 向“干净电脑只通过 setup.exe 安装即可使用”的产品标准推进
 
-PI Agent(`@earendil-works/pi-coding-agent` v0.82.0)**原生提供 `--mode rpc` 接口**，并导出了完整 TypeScript 类型的 `RpcClient` 客户端类。桌面 UI 只需作为该 RPC 内核的「前端外壳」，**无需修改 Pi 源码、无需逆向协议**，即可完整驱动会话、流式回复、模型切换、工具执行与审批。
+产品化差距评估见：
 
-推荐技术栈：**Electron + React + TypeScript + Vite**（主进程直接复用 `RpcClient`，零协议重写成本）。
+- [docs/05-setup安装即用产品化差距评估.md](docs/05-setup安装即用产品化差距评估.md)
+
+## 开发
+
+```bash
+npm install
+npm run tauri -- dev
+```
+
+## 构建
+
+构建前确保 `src-tauri/pi-bundle/` 已包含 Pi runtime。可用脚本从全局 npm 安装的 Pi 复制：
+
+```bat
+scripts\bundle-pi.bat
+```
+
+然后构建 release：
+
+```bash
+npm run tauri -- build
+```
+
+产物位置：
+
+- `src-tauri/target/release/bundle/nsis/PiDesk_0.2.0_x64-setup.exe`
+- `src-tauri/target/release/bundle/msi/PiDesk_0.2.0_x64_en-US.msi`
+
+## 验证
+
+```bash
+npm run build
+cd src-tauri && cargo check
+```
+
+如修改 release 打包链路，还需要运行：
+
+```bash
+npm run tauri -- build
+```
+
+并检查 release 产物中存在：
+
+- `pi-bundle/node.exe`
+- `pi-bundle/package.json`
+- `pi-bundle/dist/rpc-entry.js`
+- `pi-bundle/node_modules/`
+
+## 文档
+
+保留文档：
+
+- `docs/05-setup安装即用产品化差距评估.md`：安装即用产品化差距与路线图
+- `docs/session-per-file-refactor.md`：会话文件级重构记录
+- `AUDIT.md` / `IMPROVEMENTS.md`：历史审计与改进记录
+
+早期 Electron 方案文档已删除，避免与当前 Tauri 实现冲突。

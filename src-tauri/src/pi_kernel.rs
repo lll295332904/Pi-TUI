@@ -1,52 +1,41 @@
-use crate::pi_locator::find_pi_cli;
+use crate::pi_locator::{find_pi_runtime, PiRuntime};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tauri::{AppHandle, Emitter};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command as TokioCommand};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 // ── Windows console UTF-8 setup ──
 
-/// Ensure the process has a console with UTF-8 (CP 65001) code pages.
+/// Set console code page to UTF-8 (CP 65001) if a console is already attached.
 ///
 /// On Windows, child processes (cmd.exe, bash.exe) inherit the parent's
 /// console code page. The system default is GBK (CP 936) on Chinese Windows,
 /// which causes Pi to capture garbled Chinese text from tool outputs.
 ///
-/// This function:
-/// 1. If no console exists (GUI app), allocates a hidden one.
-/// 2. Sets both input and output code pages to UTF-8 (65001).
+/// In release builds, the app is a GUI subsystem (no console), so we skip
+/// console allocation to avoid flashing a cmd window. The child Pi process
+/// uses CREATE_NO_WINDOW and handles encoding internally.
 ///
-/// Must be called before spawning Pi so that Pi and its children inherit
-/// the UTF-8 console.
+/// In debug builds (run from terminal), the existing console is set to UTF-8.
 #[cfg(windows)]
 fn ensure_utf8_console() {
-    use windows_sys::Win32::System::Console::{
-        AllocConsole, GetConsoleWindow, SetConsoleCP, SetConsoleOutputCP,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
+    use windows_sys::Win32::System::Console::{GetConsoleWindow, SetConsoleCP, SetConsoleOutputCP};
 
     const CP_UTF8: u32 = 65001;
-    const SW_HIDE: i32 = 0;
 
     unsafe {
-        // If no console exists, allocate a hidden one
-        if GetConsoleWindow().is_null() {
-            if AllocConsole() != 0 {
-                let hwnd = GetConsoleWindow();
-                if !hwnd.is_null() {
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-            }
+        // Only set code page if a console already exists (e.g., running from terminal in dev mode).
+        // Do NOT allocate a new console — that would flash a cmd window in release builds.
+        if !GetConsoleWindow().is_null() {
+            SetConsoleOutputCP(CP_UTF8);
+            SetConsoleCP(CP_UTF8);
         }
-        // Set console code pages to UTF-8
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
     }
 }
 
@@ -92,7 +81,10 @@ pub enum PiRequest {
     #[serde(rename = "fork")]
     Fork { entry_id: String },
     #[serde(rename = "switch_session")]
-    SwitchSession { path: String },
+    SwitchSession {
+        #[serde(rename = "sessionPath")]
+        path: String,
+    },
     #[serde(rename = "bash")]
     Bash { command: String },
     #[serde(rename = "compact")]
@@ -113,6 +105,8 @@ pub enum PiRequest {
         #[serde(flatten)]
         data: Value,
     },
+    #[serde(rename = "new_session")]
+    NewSession,
 }
 
 /// What we send to the frontend: { sessionId, kind: "agent-event", event }
@@ -156,21 +150,24 @@ impl PiKernelManager {
         provider: Option<String>,
         model: Option<String>,
     ) -> PiResult<String> {
-        let cli_path = find_pi_cli().map_err(|e| PiError::CliNotFound(e))?;
+        let runtime = find_pi_runtime().map_err(|e| PiError::CliNotFound(e))?;
         let session_id = Uuid::new_v4().to_string();
 
-        // Build args: pi --mode rpc ...
-        let mut cmd = TokioCommand::new(&cli_path);
-        cmd.arg("--mode").arg("rpc");
+        let (program, args) = runtime.command_for_rpc();
+
+        let mut cmd = TokioCommand::new(&program);
+        for arg in &args {
+            cmd.arg(arg);
+        }
         cmd.current_dir(&cwd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // Suppress console window on Windows when launching .cmd scripts
+        // Suppress console window on Windows
         #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x08000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
 
         // Set environment for provider/model if specified
         if let Some(ref p) = provider {
@@ -179,12 +176,37 @@ impl PiKernelManager {
         if let Some(ref m) = model {
             cmd.env("PI_MODEL", m);
         }
+        if let PiRuntime::Bundled { root, .. } = &runtime {
+            cmd.env("PI_PACKAGE_DIR", root);
+        }
 
         // Ensure UTF-8 console code page so Pi's child processes (cmd/bash)
         // output UTF-8 instead of system-default GBK on Chinese Windows.
         ensure_utf8_console();
 
         let mut child = cmd.spawn()?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(status) = child.try_wait()? {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_text).await;
+            }
+            let mut stdout_text = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut stdout_text).await;
+            }
+            let details = [stderr_text.trim(), stdout_text.trim()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(PiError::Session(format!(
+                "Pi RPC process exited during startup with status {}{}",
+                status,
+                if details.is_empty() { String::new() } else { format!(": {}", details) }
+            )));
+        }
 
         let stdout = child.stdout.take().expect("stdout not available");
         let stdin = child.stdin.take().expect("stdin not available");
@@ -308,9 +330,21 @@ impl PiKernelManager {
     /// Stop a session (kill the child process)
     pub async fn stop_session(&mut self, session_id: &str) -> PiResult<()> {
         if let Some(mut session) = self.sessions.remove(session_id) {
+            // Drop stdin first so Pi sees EOF and may flush
+            drop(session.stdin);
+            // Give Pi a moment to flush JSONL writes to disk
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let _ = session.child.kill().await;
         }
         Ok(())
+    }
+
+    /// Gracefully shut down all sessions (called on app close)
+    pub async fn shutdown_all(&mut self) {
+        let ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for id in ids {
+            let _ = self.stop_session(&id).await;
+        }
     }
 
     /// Check if a session's Pi process is still running

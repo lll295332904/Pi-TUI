@@ -1,6 +1,7 @@
-import { useState, useRef, useEffect } from "react";
-import { Plus, MessageSquare, History, ChevronRight, ChevronDown, Pin, X, Layers } from "lucide-react";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { Plus, MessageSquare, History, ChevronRight, ChevronDown, Pin, X, Layers, Download, Loader2 } from "lucide-react";
 import { usePiDeskStore } from "../store/pidesk";
+import { exportHtml } from "../bridge";
 import { useT } from "../i18n";
 import type { SessionVM, PiSessionMeta } from "../types";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -37,6 +38,21 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
   // Context menu
   const [ctxMenu, setCtxMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
+  const [resumingIds, setResumingIds] = useState<Set<string>>(new Set());
+
+  // Wrap onResumeSession to track loading state
+  const handleResumeWithLoading = useCallback(async (dirName: string, cwd: string) => {
+    setResumingIds(prev => new Set(prev).add(dirName));
+    try {
+      await onResumeSession(dirName, cwd);
+    } finally {
+      setResumingIds(prev => {
+        const next = new Set(prev);
+        next.delete(dirName);
+        return next;
+      });
+    }
+  }, [onResumeSession]);
 
   useEffect(() => {
     if (ctxMenu) {
@@ -60,7 +76,7 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
     if (!name || !editingTarget) { setEditingTarget(null); return; }
     if (editingTarget.type === "session") {
       onRenameSession(editingTarget.id, name);
-      if (editingTarget.cwd) usePiDeskStore.getState().setSessionName(editingTarget.cwd, name);
+      if (editingTarget.id) usePiDeskStore.getState().setSessionName(editingTarget.id, name);
     } else {
       renameProject(editingTarget.id, name);
     }
@@ -75,7 +91,8 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
 
   // ── Data partitioning ──
   const allSessions = Object.values(sessions);
-  const inactiveHistorical = historicalSessions.filter(hs => !allSessions.some(s => s.cwd === hs.cwd));
+  // Match by file-level ID (not cwd) since multiple sessions can share the same cwd
+  const inactiveHistorical = historicalSessions.filter(hs => !allSessions.some(s => s.fileId === hs.id));
 
   // Standalone sessions (no workspaceCwd or workspace no longer exists)
   const standaloneSessions = allSessions.filter(s => !s.workspaceCwd || !projects[s.workspaceCwd]);
@@ -253,11 +270,14 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
                 {wsHistory.length > 0 && (
                   <div className="ml-3 mt-0.5">
                     {wsHistory.map(h => (
-                      <div key={h.id} onClick={() => onResumeSession(h.id, h.cwd)}
-                        className="flex items-center gap-2 pl-6 pr-2 py-1 text-xs rounded-md cursor-pointer
-                                   text-gray-500 hover:bg-sidebar-hover transition-colors">
-                        <History size={11} className="shrink-0 text-muted" />
-                        <span className="truncate flex-1">{sessionNames[h.cwd] || h.cwd.split("\\").pop() || "Untitled"}</span>
+                      <div key={h.id} onClick={() => handleResumeWithLoading(h.id, h.cwd)}
+                        className={`flex items-center gap-2 pl-6 pr-2 py-1 text-xs rounded-md cursor-pointer
+                                   text-gray-500 hover:bg-sidebar-hover transition-colors ${resumingIds.has(h.id) ? "opacity-60 pointer-events-none" : ""}`}>
+                        {resumingIds.has(h.id)
+                          ? <Loader2 size={11} className="shrink-0 text-accent animate-spin" />
+                          : <History size={11} className="shrink-0 text-muted" />
+                        }
+                        <span className="truncate flex-1">{h.name || sessionNames[h.id] || "Untitled"}</span>
                       </div>
                     ))}
                   </div>
@@ -285,11 +305,14 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
               />
             ))}
             {standaloneHistory.map(h => (
-              <div key={h.id} onClick={() => onResumeSession(h.id, h.cwd)}
-                className="flex items-center gap-2 pl-6 pr-2 py-1 text-xs rounded-md cursor-pointer
-                           text-gray-500 hover:bg-sidebar-hover transition-colors">
-                <History size={11} className="shrink-0 text-muted" />
-                <span className="truncate flex-1">{sessionNames[h.cwd] || h.cwd.split("\\").pop()}</span>
+              <div key={h.id} onClick={() => handleResumeWithLoading(h.id, h.cwd)}
+                className={`flex items-center gap-2 pl-6 pr-2 py-1 text-xs rounded-md cursor-pointer
+                           text-gray-500 hover:bg-sidebar-hover transition-colors ${resumingIds.has(h.id) ? "opacity-60 pointer-events-none" : ""}`}>
+                {resumingIds.has(h.id)
+                  ? <Loader2 size={11} className="shrink-0 text-accent animate-spin" />
+                  : <History size={11} className="shrink-0 text-muted" />
+                }
+                <span className="truncate flex-1">{h.name || sessionNames[h.id] || "Untitled"}</span>
               </div>
             ))}
           {normalStandalone.length === 0 && standaloneHistory.length === 0 && (
@@ -313,6 +336,17 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
             }}>
             <MessageSquare size={12} />
             Rename
+          </button>
+          {/* Export HTML */}
+          <button className="w-full text-left px-3 py-1.5 hover:bg-sidebar-hover flex items-center gap-2"
+            onClick={() => {
+              exportHtml(ctxSession.id).then((r) => {
+                usePiDeskStore.getState().addToast({ type: "success", title: "Exported", message: `Saved to ${r.path}` });
+              }).catch(console.error);
+              setCtxMenu(null);
+            }}>
+            <Download size={12} />
+            Export HTML
           </button>
           {/* Pin / Unpin */}
           <button className="w-full text-left px-3 py-1.5 hover:bg-sidebar-hover flex items-center gap-2"

@@ -19,12 +19,15 @@ mkdir "%BUNDLE_DIR%"
 echo Copying Pi dist...
 robocopy "%PI_SRC%\dist" "%BUNDLE_DIR%\dist" /e /njh /njs /ndl >nul
 
+echo Copying Pi package metadata...
+copy /y "%PI_SRC%\package.json" "%BUNDLE_DIR%\package.json" >nul
+
 echo Copying Pi dependencies...
 robocopy "%PI_SRC%\node_modules" "%BUNDLE_DIR%\node_modules" /e /njh /njs /ndl >nul
 
 echo Copying node.exe...
-if exist "%PI_SRC%\..\node.exe" (
-    copy /y "%PI_SRC%\..\node.exe" "%BUNDLE_DIR%\node.exe" >nul
+if exist "%APPDATA%\npm\node.exe" (
+    copy /y "%APPDATA%\npm\node.exe" "%BUNDLE_DIR%\node.exe" >nul
 ) else if exist "C:\Program Files\nodejs\node.exe" (
     copy /y "C:\Program Files\nodejs\node.exe" "%BUNDLE_DIR%\node.exe" >nul
 ) else (

@@ -30,7 +30,10 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "pi-bundle/*": "./"
+      "pi-bundle/node.exe": "pi-bundle/node.exe",
+      "pi-bundle/package.json": "pi-bundle/package.json",
+      "pi-bundle/dist/": "pi-bundle/dist/",
+      "pi-bundle/node_modules/": "pi-bundle/node_modules/"
     },
     "icon": [
       "icons/32x32.png",

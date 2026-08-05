@@ -2,6 +2,8 @@
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+export const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 export interface ModelInfo {
   provider: string;
   model: string;
@@ -147,8 +149,9 @@ export interface RpcSessionState {
 // ── Session persistence ──
 
 export interface PiSessionMeta {
-  id: string;          // directory name (encoded cwd)
+  id: string;          // file-level ID: "dirname/filename" (globally unique)
   cwd: string;         // decoded working directory
+  name: string;        // auto-generated from first user message (first 24 chars)
   last_modified: number;
   entry_count: number;
 }
@@ -171,6 +174,7 @@ export interface SessionVM {
   id: string;
   name: string;
   cwd: string;
+  fileId?: string;          // persistent file-level ID ("dirname/filename"), set when resuming
   workspaceCwd?: string;   // if set, belongs to this workspace; undefined = standalone
   model?: { provider: string; id: string };
   thinkingLevel: ThinkingLevel;

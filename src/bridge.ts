@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { PiOutboundEvent, ThinkingLevel, BashResult, SessionEntry, SessionTreeNode, PiSessionMeta, SessionEntryVm, AvailableModel } from "./types";
+import type { PiOutboundEvent, ThinkingLevel, PiSessionMeta, SessionEntryVm, AvailableModel } from "./types";
 
 // ── Commands (Renderer → Main) ──
 
@@ -22,6 +22,10 @@ export async function prompt(sessionId: string, message: string, images?: string
 
 export async function steer(sessionId: string, message: string): Promise<void> {
   return invoke("steer", { sessionId, message });
+}
+
+export async function newPiSession(sessionId: string): Promise<void> {
+  return invoke("new_session", { sessionId });
 }
 
 export async function followUp(sessionId: string, message: string): Promise<void> {
@@ -83,13 +87,13 @@ export async function respondExtensionUi(
 export async function getEntries(
   sessionId: string,
   since?: string
-): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
+): Promise<void> {
   return invoke("get_entries", { sessionId, since: since ?? null });
 }
 
 export async function getTree(
   sessionId: string
-): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
+): Promise<void> {
   return invoke("get_tree", { sessionId });
 }
 
@@ -101,8 +105,8 @@ export async function switchSession(sessionId: string, path: string): Promise<vo
   return invoke("switch_session", { sessionId, path });
 }
 
-export async function bash(sessionId: string, cmd: string): Promise<BashResult> {
-  return invoke<BashResult>("bash_exec", { sessionId, command: cmd });
+export async function bash(sessionId: string, cmd: string): Promise<void> {
+  return invoke("bash_exec", { sessionId, command: cmd });
 }
 
 export async function compactSession(sessionId: string): Promise<void> {
@@ -129,8 +133,8 @@ export async function listPiSessions(): Promise<PiSessionMeta[]> {
   return invoke<PiSessionMeta[]>("list_pi_sessions");
 }
 
-export async function loadSessionEntries(sessionDir: string): Promise<SessionEntryVm[]> {
-  return invoke<SessionEntryVm[]>("load_session_entries", { sessionDir });
+export async function loadSessionEntries(sessionId: string): Promise<SessionEntryVm[]> {
+  return invoke<SessionEntryVm[]>("load_session_entries", { sessionId });
 }
 
 // ── Pi config files ──
@@ -192,8 +196,8 @@ export async function fetchModelsFromUrl(baseUrl: string, apiKey?: string): Prom
   return invoke<FetchedModel[]>("fetch_models_from_url", { baseUrl, apiKey });
 }
 
-export async function deletePiSession(cwd: string): Promise<void> {
-  return invoke("delete_pi_session", { cwd });
+export async function deletePiSession(sessionId: string): Promise<void> {
+  return invoke("delete_pi_session", { sessionId });
 }
 
 export async function saveUserdata(data: Record<string, unknown>): Promise<void> {
@@ -202,6 +206,10 @@ export async function saveUserdata(data: Record<string, unknown>): Promise<void>
 
 export async function loadUserdata(): Promise<Record<string, unknown>> {
   return invoke<Record<string, unknown>>("load_userdata");
+}
+
+export async function getSessionsDir(): Promise<string> {
+  return invoke<string>("get_sessions_dir");
 }
 
 export async function checkPiHealth(sessionId: string): Promise<boolean> {

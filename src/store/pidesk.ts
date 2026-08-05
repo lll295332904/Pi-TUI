@@ -99,7 +99,7 @@ interface PiDeskState {
   setActiveSession: (id: string, vm: SessionVM) => void;
   updateSessionStatus: (id: string, status: SessionStatus) => void;
   renameSession: (id: string, name: string) => void;
-  setSessionName: (cwd: string, name: string) => void;
+  setSessionName: (sessionId: string, name: string) => void;
   removeSession: (id: string) => void;
   setAvailableModels: (models: AvailableModel[]) => void;
   updateSessionModel: (id: string, provider: string, modelId: string) => void;
@@ -200,15 +200,18 @@ export const usePiDeskStore = create<PiDeskState>()(
         set((s) => {
           const sess = s.sessions[id];
           if (!sess) return s;
-          return {
+          const persistKey = sess.fileId || id;
+          const next = {
             sessions: { ...s.sessions, [id]: { ...sess, name } },
-            sessionNames: { ...s.sessionNames, [sess.cwd]: name },
+            sessionNames: { ...s.sessionNames, [persistKey]: name },
           };
+          saveManual(next);
+          return next;
         }),
 
-      setSessionName: (cwd, name) =>
+      setSessionName: (id, name) =>
         set((s) => {
-          const next = { sessionNames: { ...s.sessionNames, [cwd]: name } };
+          const next = { sessionNames: { ...s.sessionNames, [id]: name } };
           saveManual(next);
           return next;
         }),
@@ -217,9 +220,11 @@ export const usePiDeskStore = create<PiDeskState>()(
         set((s) => {
           const { [id]: _, ...restSessions } = s.sessions;
           const { [id]: __, ...restTimelines } = s.sessionTimelines;
+          const { [id]: ___, ...restNames } = s.sessionNames;
           return {
             sessions: restSessions,
             sessionTimelines: restTimelines,
+            sessionNames: restNames,
             activeSessionId: s.activeSessionId === id ? null : s.activeSessionId,
           };
         }),
@@ -300,9 +305,7 @@ export const usePiDeskStore = create<PiDeskState>()(
 
       setHistoricalSessions: (list) =>
         set({
-          historicalSessions: list.filter(
-            (item, index, self) => index === self.findIndex((t) => t.cwd === item.cwd),
-          ),
+          historicalSessions: list,
         }),
 
       setPendingApproval: (req) => set({ pendingApproval: req }),
@@ -397,15 +400,7 @@ export const usePiDeskStore = create<PiDeskState>()(
           const next = {
             sessions: {
               ...s.sessions,
-              [sessionId]: {
-                id: sess.id,
-                name: sess.name,
-                cwd: sess.cwd,
-                workspaceCwd,
-                model: sess.model,
-                thinkingLevel: sess.thinkingLevel,
-                status: sess.status,
-              },
+              [sessionId]: { ...sess, workspaceCwd },
             },
             sessionWorkspaces: { ...s.sessionWorkspaces, [sess.cwd]: workspaceCwd },
           };
@@ -417,19 +412,10 @@ export const usePiDeskStore = create<PiDeskState>()(
         set((s) => {
           const sess = s.sessions[sessionId];
           if (!sess) return s;
-          const { [sess.cwd]: _, ...restWs } = s.sessionWorkspaces;
+          const { workspaceCwd: _, ...cleanSess } = sess;
+          const { [sess.cwd]: __, ...restWs } = s.sessionWorkspaces;
           const next = {
-            sessions: {
-              ...s.sessions,
-              [sessionId]: {
-                id: sess.id,
-                name: sess.name,
-                cwd: sess.cwd,
-                model: sess.model,
-                thinkingLevel: sess.thinkingLevel,
-                status: sess.status,
-              },
-            },
+            sessions: { ...s.sessions, [sessionId]: cleanSess },
             sessionWorkspaces: restWs,
           };
           saveManual(next);
@@ -497,6 +483,7 @@ export const usePiDeskStore = create<PiDeskState>()(
         projects: s.projects,
         pinned: s.pinned,
         language: s.language,
+        lastActiveCwd: s.lastActiveCwd,
       }),
       version: 1,
       onRehydrateStorage: () => undefined, // handled in App.tsx useEffect

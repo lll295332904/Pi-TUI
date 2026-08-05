@@ -163,6 +163,22 @@ function SystemLine({ text }: { text: string }) {
 }
 
 function formatToolSummary(toolName: string, input: unknown): string {
+  return extractToolParam(toolName, input);
+}
+
+function formatToolInput(toolName: string, input: unknown): string {
+  const inp = input as Record<string, unknown> | undefined;
+  if (!inp) return JSON.stringify(input, null, 2);
+  if (toolName === "edit") {
+    const edits = inp.edits as Array<{ oldText: string; newText: string }> | undefined;
+    return edits ? edits.map(e => `- ${e.oldText?.slice(0, 80)}\n+ ${e.newText?.slice(0, 80)}`).join("\n---\n") : JSON.stringify(inp, null, 2);
+  }
+  if (toolName === "bash") return (inp.command as string) ?? JSON.stringify(inp, null, 2);
+  return JSON.stringify(inp, null, 2);
+}
+
+/** Extract the most salient param for a summary line. */
+function extractToolParam(toolName: string, input: unknown): string {
   const inp = input as Record<string, unknown> | undefined;
   if (!inp) return "";
   switch (toolName) {
@@ -170,15 +186,5 @@ function formatToolSummary(toolName: string, input: unknown): string {
     case "read": case "edit": case "write": return (inp.path as string) ?? "";
     case "grep": return (inp.pattern as string)?.slice(0, 40) ?? "";
     default: return JSON.stringify(input).slice(0, 40);
-  }
-}
-
-function formatToolInput(toolName: string, input: unknown): string {
-  const inp = input as Record<string, unknown> | undefined;
-  if (!inp) return JSON.stringify(input, null, 2);
-  switch (toolName) {
-    case "bash": return (inp.command as string) ?? JSON.stringify(inp, null, 2);
-    case "edit": { const edits = inp.edits as Array<{ oldText: string; newText: string }> | undefined; return edits ? edits.map(e => `- ${e.oldText?.slice(0, 80)}\n+ ${e.newText?.slice(0, 80)}`).join("\n---\n") : JSON.stringify(inp, null, 2); }
-    default: return JSON.stringify(inp, null, 2);
   }
 }

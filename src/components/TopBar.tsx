@@ -1,10 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { usePiDeskStore } from "../store/pidesk";
+import { compactSession, exportHtml } from "../bridge";
 import type { AvailableModel } from "../types";
-import { Settings, PanelRight, Shrink, Terminal, ChevronDown } from "lucide-react";
-import { ROLE_LABELS, DISCONNECTED_ROLES } from "../types";
-
-const THINKING_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+import { Settings, PanelRight, Shrink, Terminal, ChevronDown, Download } from "lucide-react";
+import { ROLE_LABELS, DISCONNECTED_ROLES, THINKING_LEVELS } from "../types";
 
 interface Props {
   onChangeModel: (provider: string, modelId: string) => void;
@@ -119,7 +118,7 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
             </button>
             {thinkingOpen && (
               <div className="absolute right-0 top-full mt-1 z-40 w-28 bg-white border border-border rounded-lg shadow-xl text-xs">
-                {THINKING_OPTIONS.map((lvl) => (
+                {THINKING_LEVELS.map((lvl) => (
                   <button
                     key={lvl}
                     onClick={() => {
@@ -152,9 +151,32 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
              session.status === "compacting" ? "Compacting" : "Idle"}
           </span>
         )}
+        {/* Export HTML */}
+        {session && (
+          <button
+            onClick={() => {
+              if (activeId) exportHtml(activeId).then((r) => {
+                usePiDeskStore.getState().addToast({
+                  type: "success",
+                  title: "Exported",
+                  message: `Saved to ${r.path}`,
+                });
+              }).catch(console.error);
+            }}
+            className="text-gray-500 hover:text-gray-700 transition-colors"
+            title="Export session as HTML"
+          >
+            <Download size={15} />
+          </button>
+        )}
+
         {/* Compaction */}
         {session?.status !== "idle" && (
-          <button className="text-gray-400 hover:text-warning transition-colors" title="Trigger compaction">
+          <button
+            onClick={() => { if (activeId) compactSession(activeId).catch(console.error); }}
+            className="text-gray-400 hover:text-warning transition-colors"
+            title="Trigger compaction"
+          >
             <Shrink size={14} />
           </button>
         )}
