@@ -168,7 +168,7 @@ export interface SessionEntryVm {
 
 // ── Frontend ViewModel ──
 
-export type SessionStatus = "idle" | "streaming" | "compacting" | "retrying";
+export type SessionStatus = "idle" | "streaming" | "compacting" | "retrying" | "starting" | "failed" | "exited" | "reconnecting";
 
 export interface SessionVM {
   id: string;
@@ -179,6 +179,7 @@ export interface SessionVM {
   model?: { provider: string; id: string };
   thinkingLevel: ThinkingLevel;
   status: SessionStatus;
+  createdAt?: number;      // creation timestamp, used for ordering (newest first); filled by setActiveSession
 }
 
 export interface MessageVM {

@@ -1,6 +1,10 @@
 mod pi_locator;
 mod pi_kernel;
 mod commands;
+#[allow(dead_code)]
+mod error;
+#[allow(dead_code)]
+mod logger;
 
 use pi_kernel::PiKernelManager;
 use std::sync::Arc;
@@ -41,6 +45,7 @@ pub fn run() {
             commands::session::list_pi_sessions,
             commands::session::load_session_entries,
             commands::session::check_pi_health,
+            commands::session::restart_session,
             commands::session::get_sessions_dir,
             commands::session::delete_pi_session,
             commands::prompt_cmds::prompt,
@@ -72,6 +77,8 @@ pub fn run() {
             commands::prompt_cmds::fetch_models_from_url,
             commands::prompt_cmds::save_userdata,
             commands::prompt_cmds::load_userdata,
+            commands::diagnostics::run_startup_diagnostics,
+            commands::diagnostics::export_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

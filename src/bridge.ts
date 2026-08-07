@@ -46,8 +46,86 @@ export async function getThinkingLevels(provider: string, modelId: string): Prom
   return invoke<string[]>("get_thinking_levels", { provider, modelId });
 }
 
+// ── Model & Thinking ──
+
+// Pending set_model requests awaiting the correlated pi rpc-response.
+// `send_cmd!` in Rust is fire-and-forget: the Tauri command returns as soon
+// as the JSON is written to pi's stdin. The actual switch result arrives
+// asynchronously as an `rpc-response` event, which we correlate by `id`.
+interface PendingSetModel {
+  sessionId: string;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  settle: () => void;
+}
+const pendingSetModel = new Map<string, PendingSetModel>();
+// Tauri's listen() is asynchronous. Keep its promise so a fast response
+// cannot arrive before the correlation listener is registered.
+let setModelListenerPromise: Promise<() => void> | null = null;
+
+function attachSetModelResponseListener(): Promise<() => void> {
+  if (setModelListenerPromise) return setModelListenerPromise;
+  setModelListenerPromise = listen<PiOutboundEvent>("pi:event", (event) => {
+    const ev = event.payload;
+    if (ev.kind !== "rpc-response") return;
+    const rpc = ev.event as { command?: string; success?: boolean; error?: string; id?: string };
+    if (rpc.command !== "set_model" || !rpc.id) return;
+    const pending = pendingSetModel.get(rpc.id);
+    if (!pending || pending.sessionId !== ev.sessionId) return;
+    pendingSetModel.delete(rpc.id);
+    if (rpc.success) pending.resolve();
+    else pending.reject(new Error(rpc.error || "set_model failed"));
+  }).catch((error) => {
+    setModelListenerPromise = null;
+    throw error;
+  });
+  return setModelListenerPromise;
+}
+
 export async function setModel(sessionId: string, provider: string, modelId: string): Promise<void> {
-  return invoke("set_model", { sessionId, provider, modelId });
+  if (!modelId || modelId === "undefined" || modelId === "null") {
+    throw new Error(`Invalid model ID: "${modelId}" for provider "${provider}". The model setting may be corrupted — please reconfigure in Settings.`);
+  }
+  await attachSetModelResponseListener();
+  const id = crypto.randomUUID();
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      pendingSetModel.delete(id);
+    };
+    // If pi never answers (e.g. process exited), don't hang the caller forever.
+    const timer = setTimeout(() => {
+      settle();
+      reject(new Error(`Model switch timed out for ${provider}/${modelId}`));
+    }, 15000);
+    pendingSetModel.set(id, {
+      sessionId,
+      resolve: () => { settle(); resolve(); },
+      reject: (err) => { settle(); reject(err); },
+      settle,
+    });
+    invoke("set_model", { sessionId, provider, modelId, id }).catch((e) => {
+      settle();
+      reject(e instanceof Error ? e : new Error(String(e)));
+    });
+  });
+}
+
+/**
+ * Strict validator for a model reference. Returns false for null/undefined,
+ * missing/empty provider or id, or the literal strings "undefined"/"null"
+ * (which is what corrupted localStorage serializes as).
+ */
+export function isValidModelRef(ref: { provider?: unknown; id?: unknown } | null | undefined): ref is { provider: string; id: string } {
+  return (
+    !!ref &&
+    typeof ref.provider === "string" && ref.provider.trim() !== "" &&
+    typeof ref.id === "string" && ref.id.trim() !== "" &&
+    ref.id !== "undefined" && ref.id !== "null"
+  );
 }
 
 export async function setThinkingLevel(sessionId: string, level: ThinkingLevel): Promise<void> {
@@ -214,6 +292,36 @@ export async function getSessionsDir(): Promise<string> {
 
 export async function checkPiHealth(sessionId: string): Promise<boolean> {
   return invoke<boolean>("check_pi_health", { sessionId });
+}
+
+export async function restartSession(sessionId: string, cwd: string): Promise<void> {
+  return invoke("restart_session", { sessionId, cwd });
+}
+
+// ── Startup Diagnostics ──
+
+export interface CheckItem { ok: boolean; detail: string; }
+export interface DiagnosticError { component: string; message: string; }
+export interface StartupDiagnostics {
+  ok: boolean;
+  pi_bundle: {
+    node: CheckItem;
+    package_json: CheckItem;
+    rpc_entry: CheckItem;
+    index_entry: CheckItem;
+    node_modules: CheckItem;
+  };
+  user_data: { pi_agent_dir: string; readable: boolean; writable: boolean };
+  versions: { app_version: string; bundled_pi_version?: string };
+  errors: DiagnosticError[];
+}
+
+export async function runStartupDiagnostics(): Promise<StartupDiagnostics> {
+  return invoke<StartupDiagnostics>("run_startup_diagnostics");
+}
+
+export async function exportDiagnostics(): Promise<string> {
+  return invoke<string>("export_diagnostics");
 }
 
 // ── Events (Main → Renderer) ──

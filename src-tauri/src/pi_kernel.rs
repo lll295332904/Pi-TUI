@@ -71,7 +71,16 @@ pub enum PiRequest {
     #[serde(rename = "abort")]
     Abort,
     #[serde(rename = "set_model")]
-    SetModel { provider: String, model: String },
+    SetModel {
+        provider: String,
+        // pi rpc-mode expects `modelId` (see rpc-mode.js `set_model` handler)
+        #[serde(rename = "modelId")]
+        model: String,
+        // Correlation id echoed back by pi in the rpc-response, so the
+        // frontend can await the actual switch result instead of fire-and-forget.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     #[serde(rename = "set_thinking_level")]
     SetThinkingLevel { level: String },
     #[serde(rename = "get_entries")]
@@ -79,7 +88,11 @@ pub enum PiRequest {
     #[serde(rename = "get_tree")]
     GetTree,
     #[serde(rename = "fork")]
-    Fork { entry_id: String },
+    Fork {
+        // pi rpc-mode expects `entryId`
+        #[serde(rename = "entryId")]
+        entry_id: String,
+    },
     #[serde(rename = "switch_session")]
     SwitchSession {
         #[serde(rename = "sessionPath")]
@@ -90,7 +103,11 @@ pub enum PiRequest {
     #[serde(rename = "compact")]
     Compact,
     #[serde(rename = "export_html")]
-    ExportHtml { out: Option<String> },
+    ExportHtml {
+        // pi rpc-mode expects `outputPath`
+        #[serde(rename = "outputPath")]
+        out: Option<String>,
+    },
     #[serde(rename = "set_steering_mode")]
     SetSteeringMode { mode: String },
     #[serde(rename = "set_follow_up_mode")]
@@ -357,5 +374,119 @@ impl PiKernelManager {
         } else {
             false
         }
+    }
+
+    /// Restart a session's Pi process. Stops existing, starts new with same cwd.
+    /// Returns the same session_id (reused). The frontend should re-apply settings.
+    pub async fn restart_session(
+        &mut self,
+        app: AppHandle,
+        session_id: &str,
+        cwd: &str,
+    ) -> PiResult<()> {
+        // Stop existing process
+        if let Some(mut session) = self.sessions.remove(session_id) {
+            drop(session.stdin);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = session.child.kill().await;
+        }
+
+        let runtime = find_pi_runtime().map_err(|e| PiError::CliNotFound(e))?;
+        let (program, args) = runtime.command_for_rpc();
+
+        let mut cmd = TokioCommand::new(&program);
+        for arg in &args {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000008);
+
+        if let PiRuntime::Bundled { root, .. } = &runtime {
+            cmd.env("PI_PACKAGE_DIR", root);
+        }
+
+        ensure_utf8_console();
+
+        let mut child = cmd.spawn()?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(status) = child.try_wait()? {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_text).await;
+            }
+            let mut stdout_text = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut stdout_text).await;
+            }
+            let details = [stderr_text.trim(), stdout_text.trim()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(PiError::Session(format!(
+                "Pi RPC restart exited during startup with status {}{}",
+                status,
+                if details.is_empty() { String::new() } else { format!(": {}", details) }
+            )));
+        }
+
+        let stdout = child.stdout.take().expect("stdout not available");
+        let stdin = child.stdin.take().expect("stdin not available");
+        let stderr = child.stderr.take().expect("stderr not available");
+
+        let sid1 = session_id.to_string();
+        let sid2 = session_id.to_string();
+        let app1 = app.clone();
+        let app2 = app.clone();
+
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim().to_string();
+                if line.is_empty() { continue; }
+                if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                    let msg_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let kind = match msg_type {
+                        "response" => "rpc-response",
+                        "error" => "error",
+                        "extension_ui_request" => "extension-ui-request",
+                        _ => "agent-event",
+                    };
+                    let ev = PiOutboundEvent { session_id: sid1.clone(), kind: kind.into(), event: Some(val) };
+                    let _ = app1.emit("pi:event", &ev);
+                } else {
+                    let ev = PiOutboundEvent { session_id: sid1.clone(), kind: "stderr".into(), event: Some(serde_json::json!({ "line": line })) };
+                    let _ = app1.emit("pi:event", &ev);
+                }
+            }
+            let ev = PiOutboundEvent { session_id: sid1.clone(), kind: "process-exit".into(), event: None };
+            let _ = app1.emit("pi:event", &ev);
+        });
+
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let ev = PiOutboundEvent { session_id: sid2.clone(), kind: "stderr".into(), event: Some(serde_json::json!({ "line": line })) };
+                let _ = app2.emit("pi:event", &ev);
+            }
+        });
+
+        let session = Session {
+            session_id: session_id.to_string(),
+            stdin: Mutex::new(stdin),
+            child,
+        };
+        self.sessions.insert(session_id.to_string(), session);
+
+        Ok(())
     }
 }

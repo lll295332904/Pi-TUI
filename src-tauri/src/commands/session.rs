@@ -405,3 +405,18 @@ pub async fn check_pi_health(session_id: String, state: State<'_, AppState>) -> 
     let mut kernel = state.kernel.lock().await;
     Ok(kernel.is_alive(&session_id).await)
 }
+
+/// Restart a Pi session process (for recovery after process exit)
+#[tauri::command]
+pub async fn restart_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    cwd: String,
+) -> Result<(), String> {
+    let mut kernel = state.kernel.lock().await;
+    kernel
+        .restart_session(app, &session_id, &cwd)
+        .await
+        .map_err(|e| format!("Failed to restart session: {}", e))
+}

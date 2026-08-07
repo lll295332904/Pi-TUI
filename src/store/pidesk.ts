@@ -104,6 +104,9 @@ interface PiDeskState {
   setAvailableModels: (models: AvailableModel[]) => void;
   updateSessionModel: (id: string, provider: string, modelId: string) => void;
   updateSessionThinkingLevel: (id: string, level: string) => void;
+  // Transient: sessionId → model ref currently being switched to (shown as "Switching…" in TopBar)
+  modelSwitching: Record<string, ModelRef>;
+  setModelSwitching: (id: string, ref: ModelRef | null) => void;
 
   // Actions – timeline
   appendTimeline: (item: TimelineItem) => void;
@@ -178,6 +181,7 @@ export const usePiDeskStore = create<PiDeskState>()(
       sessionWorkspaces: {},
       sessionRoles: {},
       globalRole: "main",
+      modelSwitching: {},
       language: "zh",
       inputValue: "",
       inputImages: [],
@@ -185,7 +189,7 @@ export const usePiDeskStore = create<PiDeskState>()(
       lastActiveCwd: null,
 
       setActiveSession: (id, vm) =>
-        set({ activeSessionId: id, sessions: { ...usePiDeskStore.getState().sessions, [id]: vm } }),
+        set({ activeSessionId: id, sessions: { ...usePiDeskStore.getState().sessions, [id]: { ...vm, createdAt: vm.createdAt ?? Date.now() } } }),
 
       updateSessionStatus: (id, status) =>
         set((s) => {
@@ -254,6 +258,14 @@ export const usePiDeskStore = create<PiDeskState>()(
               [id]: { ...sess, thinkingLevel: level as SessionVM["thinkingLevel"] },
             },
           };
+        }),
+
+      setModelSwitching: (id, ref) =>
+        set((s) => {
+          const next = { ...s.modelSwitching };
+          if (ref) next[id] = ref;
+          else delete next[id];
+          return { modelSwitching: next };
         }),
 
       appendTimeline: (item) =>
@@ -485,7 +497,34 @@ export const usePiDeskStore = create<PiDeskState>()(
         language: s.language,
         lastActiveCwd: s.lastActiveCwd,
       }),
-      version: 1,
+      version: 2,
+      merge: (persisted, current) => {
+        // Shallow merge (default behavior)
+        const merged = { ...current, ...(persisted as Partial<PiDeskState>) };
+        // Sanitize settings.defaultModel — clean corrupted entries where id/provider is missing or "undefined"
+        const dm = merged.settings?.defaultModel;
+        if (dm && (!dm.id || !dm.provider || dm.id === "undefined" || dm.id === "null")) {
+          console.warn("[pidesk] Cleaning corrupted defaultModel:", JSON.stringify(dm));
+          merged.settings = { ...merged.settings, defaultModel: null };
+        }
+        // Sanitize settings.roleModels — each role's ModelRef must have valid id+provider
+        if (merged.settings?.roleModels) {
+          const cleaned = { ...merged.settings.roleModels };
+          let dirty = false;
+          for (const key of Object.keys(cleaned) as (keyof RoleModels)[]) {
+            const ref = cleaned[key];
+            if (ref && (!ref.id || !ref.provider || ref.id === "undefined" || ref.id === "null")) {
+              console.warn(`[pidesk] Cleaning corrupted roleModel[${key}]:`, JSON.stringify(ref));
+              cleaned[key] = null;
+              dirty = true;
+            }
+          }
+          if (dirty) {
+            merged.settings = { ...merged.settings, roleModels: cleaned };
+          }
+        }
+        return merged as PiDeskState;
+      },
       onRehydrateStorage: () => undefined, // handled in App.tsx useEffect
     },
   ),

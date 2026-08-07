@@ -124,16 +124,20 @@ export default function Sidebar({ onNewSession, onResumeSession, onRenameSession
     return (pinned.projects.includes(a) ? 0 : 1) - (pinned.projects.includes(b) ? 0 : 1);
   });
 
-  // Sort standalone: pinned first
+  // Sort standalone: pinned first, then newest first
   const sortedStandalone = [...standaloneSessions].sort((a, b) => {
-    return (pinned.sessions.includes(a.id) ? 0 : 1) - (pinned.sessions.includes(b.id) ? 0 : 1);
+    const pin = (pinned.sessions.includes(a.id) ? 0 : 1) - (pinned.sessions.includes(b.id) ? 0 : 1);
+    if (pin !== 0) return pin;
+    return (b.createdAt ?? 0) - (a.createdAt ?? 0);
   });
   const pinnedStandalone = sortedStandalone.filter(s => pinned.sessions.includes(s.id));
   const normalStandalone = sortedStandalone.filter(s => !pinned.sessions.includes(s.id));
 
-  // Sort workspace sessions
+  // Sort workspace sessions: pinned first, then newest first
   const sortSessions = (list: SessionVM[]) => [...list].sort((a, b) => {
-    return (pinned.sessions.includes(a.id) ? 0 : 1) - (pinned.sessions.includes(b.id) ? 0 : 1);
+    const pin = (pinned.sessions.includes(a.id) ? 0 : 1) - (pinned.sessions.includes(b.id) ? 0 : 1);
+    if (pin !== 0) return pin;
+    return (b.createdAt ?? 0) - (a.createdAt ?? 0);
   });
 
   // ── Context menu handlers ──

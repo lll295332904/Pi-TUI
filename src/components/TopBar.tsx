@@ -4,6 +4,7 @@ import { compactSession, exportHtml } from "../bridge";
 import type { AvailableModel } from "../types";
 import { Settings, PanelRight, Shrink, Terminal, ChevronDown, Download } from "lucide-react";
 import { ROLE_LABELS, DISCONNECTED_ROLES, THINKING_LEVELS } from "../types";
+import { getT } from "../i18n";
 
 interface Props {
   onChangeModel: (provider: string, modelId: string) => void;
@@ -20,6 +21,9 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
   const setConsoleOpen = usePiDeskStore((s) => s.setConsoleOpen);
   const currentRole = usePiDeskStore((s) => (s.activeSessionId && s.sessionRoles[s.activeSessionId]) || s.globalRole);
   const availableModels = usePiDeskStore((s) => s.availableModels);
+  const modelSwitching = usePiDeskStore((s) => s.modelSwitching);
+  const language = usePiDeskStore((s) => s.language);
+  const t = getT(language);
 
   const session = activeId ? sessions[activeId] : null;
 
@@ -39,6 +43,7 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
 
   const currentModel = session?.model;
   const currentThinking = session?.thinkingLevel;
+  const switching = session ? modelSwitching[session.id] : undefined;
 
   return (
     <div className="h-9 flex items-center px-3 border-b border-border bg-surface-secondary select-none shrink-0">
@@ -68,12 +73,14 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
           <div ref={modelRef} className="relative">
             <button
               onClick={() => { setModelOpen(!modelOpen); setThinkingOpen(false); }}
-              className="flex items-center gap-1 text-xs text-muted hover:text-gray-700 transition-colors bg-gray-100 hover:bg-gray-200 rounded px-1.5 py-0.5"
+              disabled={!!switching}
+              className="flex items-center gap-1 text-xs text-muted hover:text-gray-700 transition-colors bg-gray-100 hover:bg-gray-200 rounded px-1.5 py-0.5 disabled:opacity-60 disabled:cursor-not-allowed"
+              title={switching ? t("topbar", "switching") : undefined}
             >
-              {currentModel ? currentModel.id : "Auto"}
+              {switching ? t("topbar", "switching") : (currentModel ? currentModel.id : "Auto")}
               <ChevronDown size={10} className={modelOpen ? "rotate-180" : ""} />
             </button>
-            {modelOpen && (
+            {modelOpen && !switching && (
               <div className="absolute right-0 top-full mt-1 z-40 w-52 bg-white border border-border rounded-lg shadow-xl text-xs max-h-60 overflow-y-auto">
                 <button
                   onClick={() => { onChangeModel("", ""); setModelOpen(false); }}

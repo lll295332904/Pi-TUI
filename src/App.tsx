@@ -3,11 +3,13 @@ import { usePiDeskStore } from "./store/pidesk";
 import {
   startSession, prompt as piPrompt, onPiEvent, abortSession, stopSession,
   listPiSessions, loadSessionEntries, getAvailableModels, deletePiSession,
-  setModel, setThinkingLevel, setAutoCompaction, setAutoRetry,
+  setThinkingLevel, setAutoCompaction, setAutoRetry,
   setSteeringMode, setFollowUpMode, checkPiHealth, loadUserdata,
   getSessionsDir, switchSession, newPiSession, steer, saveUserdata,
+  restartSession, isValidModelRef,
 } from "./bridge";
-import type { PiRawAgentEvent, TimelineItem, MessageVM, ToolCallVM, PiOutboundEvent, SessionEntryVm, ExtensionUiRequest, RoleModels, ThinkingLevel } from "./types";
+import { switchModel } from "./model-switch";
+import type { PiRawAgentEvent, TimelineItem, MessageVM, ToolCallVM, PiOutboundEvent, SessionEntryVm, ExtensionUiRequest, RoleModels, PiDeskSettings, ThinkingLevel } from "./types";
 import TopBar from "./components/TopBar";
 import Sidebar from "./components/Sidebar";
 import Conversation from "./components/Conversation";
@@ -21,6 +23,8 @@ import ApprovalDialog from "./components/ApprovalDialog";
 import ErrorBoundary from "./components/ErrorBoundary";
 import ToastContainer from "./components/ToastContainer";
 import ShortcutsPanel from "./components/ShortcutsPanel";
+import StartupDiagnosticsPanel from "./components/StartupCheck";
+import SetupWizard from "./components/SetupWizard";
 import { getT } from "./i18n";
 
 // Add this at the top of App() body after other hooks
@@ -83,10 +87,37 @@ export default function App() {
 
   // Track streaming assistant message
   const streamRef = useRef<{ id: string; thinking: string; text: string } | null>(null);
+  // Last time any pi agent event arrived (used by the response-timeout guard)
+  const lastEventRef = useRef<number>(Date.now());
   // Guard against concurrent resume for the same cwd
   const resumingRef = useRef<Set<string>>(new Set());
   const prevStatusRef = useRef<Record<string, string>>({});
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+
+  // ── Boot phase: startup diagnostics → setup wizard → main app ──
+  type BootPhase = "diagnostics" | "wizard" | "ready";
+  const [bootPhase, setBootPhase] = useState<BootPhase>("diagnostics");
+
+  // Process recovery state
+  const [exitedSessions, setExitedSessions] = useState<Set<string>>(new Set());
+  const [restartingSession, setRestartingSession] = useState<string | null>(null);
+
+  async function handleRestartSession(sessionId: string) {
+    const sess = usePiDeskStore.getState().sessions[sessionId];
+    if (!sess) return;
+    setRestartingSession(sessionId);
+    try {
+      await restartSession(sessionId, sess.cwd);
+      await applySettingsToSession(sessionId);
+      updateStatus(sessionId, "idle");
+      setExitedSessions(prev => { const n = new Set(prev); n.delete(sessionId); return n; });
+      appendTimeline({ type: "system-info", text: "Pi process restarted", timestamp: Date.now() });
+    } catch (e) {
+      appendTimeline({ type: "system-info", text: `Restart failed: ${String(e)}`, timestamp: Date.now() });
+    } finally {
+      setRestartingSession(null);
+    }
+  }
 
   // ── Role-based model switching ──
 
@@ -94,14 +125,11 @@ export default function App() {
     if (!activeId) return;
     const settings = usePiDeskStore.getState().settings;
     const roleModel = settings.roleModels[role as keyof RoleModels];
-    if (!roleModel) return;
+    if (!isValidModelRef(roleModel)) return;
 
-    try {
-      await setModel(activeId, roleModel.provider, roleModel.id);
-      setCurrentRole(role as keyof RoleModels);
-      updateSessionModel(activeId, roleModel.provider, roleModel.id);
-    } catch (e) { console.error(`Failed to switch to ${role} model:`, e); }
-  }, [activeId, setCurrentRole, updateSessionModel]);
+    const ok = await switchModel(activeId, roleModel.provider, roleModel.id);
+    if (ok) setCurrentRole(role as keyof RoleModels);
+  }, [activeId, setCurrentRole]);
 
   const restoreMainModel = useCallback(async () => {
     if (!activeId) return;
@@ -109,19 +137,22 @@ export default function App() {
     if (store.currentRole === "main") return;
 
     const mainModel = store.settings.roleModels.main || store.settings.defaultModel;
-    if (!mainModel) return;
+    if (!isValidModelRef(mainModel)) return;
 
-    try {
-      await setModel(activeId, mainModel.provider, mainModel.id);
-      setCurrentRole("main");
-      updateSessionModel(activeId, mainModel.provider, mainModel.id);
-    } catch (e) { console.error("Failed to restore main model:", e); }
-  }, [activeId, setCurrentRole, updateSessionModel]);
+    const ok = await switchModel(activeId, mainModel.provider, mainModel.id);
+    if (ok) setCurrentRole("main");
+  }, [activeId, setCurrentRole]);
 
   // ── Pi event handler ──
   const handlePiEvent = useCallback((ev: PiOutboundEvent) => {
     const store = usePiDeskStore.getState();
     const sessionId = store.activeSessionId;
+
+    // Any agent activity (thinking, text, tool calls, retries) resets the
+    // response-timeout guard — the request is clearly alive.
+    if (ev.kind === "agent-event" || ev.kind === "error") {
+      lastEventRef.current = Date.now();
+    }
 
     // Console log: append raw event JSON
     if (sessionId) {
@@ -149,8 +180,10 @@ export default function App() {
     }
 
     if (ev.kind === "process-exit") {
-      appendTimeline({ type: "system-info", text: "Pi process exited", timestamp: Date.now() });
-      updateStatus(ev.sessionId, "idle");
+      const sid = ev.sessionId;
+      appendTimeline({ type: "system-info", text: "Pi process exited. Click restart to recover.", timestamp: Date.now() });
+      updateStatus(sid, "exited");
+      setExitedSessions(prev => new Set(prev).add(sid));
       return;
     }
 
@@ -163,8 +196,43 @@ export default function App() {
     }
 
     if (ev.kind === "rpc-response") {
-      // RPC responses (from get_available_models, get_state, etc.)
-      // Currently we don't need to handle these since we read models from file
+      const rpc = ev.event as { command?: string; success?: boolean; error?: string; data?: unknown };
+      if (rpc.success === false && rpc.error) {
+        const cmd = rpc.command || "unknown";
+        appendTimeline({ type: "system-info", text: `[${cmd}] failed: ${rpc.error}`, timestamp: Date.now() });
+        const s = usePiDeskStore.getState();
+        const t = getT(s.language);
+        if (cmd === "set_model") {
+          // Model config invalid/corrupted — self-heal so the error doesn't repeat
+          if (sessionId) updateStatus(sessionId, "idle");
+          const patch: Partial<PiDeskSettings> = {};
+          const dm = s.settings.defaultModel;
+          if (dm && !isValidModelRef(dm)) patch.defaultModel = null;
+          const cleanedRoles: Partial<RoleModels> = {};
+          let roleDirty = false;
+          for (const [role, ref] of Object.entries(s.settings.roleModels)) {
+            if (ref && !isValidModelRef(ref)) { (cleanedRoles as Record<string, null>)[role] = null; roleDirty = true; }
+          }
+          if (roleDirty) patch.roleModels = { ...s.settings.roleModels, ...cleanedRoles };
+          if (Object.keys(patch).length) {
+            console.warn("[rpc-response] set_model failed, clearing corrupted model refs:", patch);
+            s.setSettings(patch);
+            s.addToast({
+              type: "error",
+              title: t("toast", "error"),
+              message: t("toast", "modelReset"),
+              durationMs: 8000,
+            });
+          }
+        } else {
+          s.addToast({
+            type: "error",
+            title: t("toast", "error"),
+            message: rpc.error,
+            durationMs: 8000,
+          });
+        }
+      }
       return;
     }
 
@@ -265,8 +333,15 @@ export default function App() {
         const toolName = event.toolName ?? "unknown";
         const tool: ToolCallVM = { toolCallId: event.toolCallId ?? `tool-${Date.now()}`, toolName, input: event.input, isError: false, state: "running", timestamp: Date.now() };
         appendTimeline({ type: "tool", ...tool } as TimelineItem);
-        // Switch to web model for web fetch / scrape tools
-        if (toolName.includes("web") || toolName.includes("fetch") || toolName.includes("scrape")) {
+        const normalizedTool = toolName.toLowerCase();
+        // Custom MCP tools are conventionally exposed as mcp__server__tool.
+        if (normalizedTool.startsWith("mcp__") || normalizedTool.startsWith("mcp_") || normalizedTool.includes("mcp.")) {
+          switchToRole("mcp");
+        } else if (/sub.?agent|delegate|spawn.?agent|child.?agent|task_agent/.test(normalizedTool)) {
+          // Pi 0.82 has no built-in sub-agent event; support installed/custom
+          // sub-agent tools without treating every normal tool as delegation.
+          switchToRole("subAgent");
+        } else if (normalizedTool.includes("web") || normalizedTool.includes("fetch") || normalizedTool.includes("scrape")) {
           switchToRole("web");
         }
         break;
@@ -286,15 +361,33 @@ export default function App() {
       case "tool_execution_end":
         updateTimelineItem(event.toolCallId ?? "", { state: "done" as const, result: event.result, isError: event.isError ?? false });
         break;
+      // Pi 0.82 emits compaction_start/compaction_end. Keep the older names
+      // as aliases for compatibility with older bundled Pi builds.
+      case "compaction_start":
       case "agent_compacting":
         if (sid) { prevStatusRef.current[sid] = "compacting"; updateStatus(sid, "compacting"); }
         switchToRole("compression");
         break;
+      case "compaction_end":
       case "agent_compacted":
         if (sid) updateStatus(sid, "streaming");
         break;
-      case "agent_retrying":
+      // Auto-retry and summarization are maintenance work performed by Pi
+      // outside the normal assistant turn.
+      case "auto_retry_start":
+      case "summarization_retry_scheduled":
+      case "summarization_retry_attempt_start":
         if (sid) updateStatus(sid, "retrying");
+        switchToRole("maintenance");
+        break;
+      case "auto_retry_end":
+      case "summarization_retry_finished":
+        if (sid) updateStatus(sid, "streaming");
+        break;
+      // Pi 0.82 emits session_info_changed after a session name has already
+      // been produced. There is no pre-title event, so switching here would
+      // affect the next task rather than the title request itself.
+      case "session_info_changed":
         break;
       case "model_changed": {
         // Pi reports model changes via events
@@ -393,7 +486,37 @@ export default function App() {
     listPiSessions().then((list) => {
       setHistoricalSessions(list);
     }).catch(console.error);
-    getAvailableModels().then(setAvailableModels).catch(console.error);
+    getAvailableModels().then((models) => {
+      setAvailableModels(models);
+      // Sanitize settings: drop defaultModel / roleModels whose provider no longer
+      // exists in the model store (e.g. after a duplicate/renamed provider entry was
+      // removed from models-store.json). Without this, a stale "DeepSeek"/etc. ref would
+      // keep firing set_model with an unknown provider and stall the session.
+      const validProviders = new Set(models.map((m) => m.provider));
+      const store = usePiDeskStore.getState();
+      const { defaultModel, roleModels } = store.settings;
+      const patch: Partial<PiDeskSettings> = {};
+      if (defaultModel && !validProviders.has(defaultModel.provider)) {
+        console.warn(`[pidesk] Dropping defaultModel with unknown provider "${defaultModel.provider}" — please reconfigure in Settings → Model.`);
+        patch.defaultModel = null;
+      }
+      if (roleModels) {
+        const cleaned: Partial<RoleModels> = {};
+        let roleDirty = false;
+        (Object.keys(roleModels) as (keyof RoleModels)[]).forEach((role) => {
+          const ref = roleModels[role];
+          if (ref && !validProviders.has(ref.provider)) {
+            console.warn(`[pidesk] Dropping roleModel[${role}] with unknown provider "${ref.provider}"`);
+            cleaned[role] = null;
+            roleDirty = true;
+          } else {
+            cleaned[role] = ref;
+          }
+        });
+        if (roleDirty) patch.roleModels = cleaned as RoleModels;
+      }
+      if (Object.keys(patch).length > 0) store.setSettings(patch);
+    }).catch(console.error);
   }, [setHistoricalSessions, setAvailableModels]);
 
   // Auto-resume last active session on startup
@@ -416,11 +539,23 @@ export default function App() {
     const state = usePiDeskStore.getState();
     const settings = state.settings;
     // Apply default model
-    if (settings.defaultModel) {
-      try {
-        await setModel(sessionId, settings.defaultModel.provider, settings.defaultModel.id);
-        updateSessionModel(sessionId, settings.defaultModel.provider, settings.defaultModel.id);
-      } catch (e) { console.error("Failed to set default model:", e); }
+    let dm = settings.defaultModel;
+    // Auto-select first available model if no default is configured
+    if (!isValidModelRef(dm)) {
+      if (dm) {
+        console.warn("[applySettingsToSession] defaultModel corrupted, clearing:", dm);
+        state.setSettings({ defaultModel: null });
+      }
+      const available = state.availableModels;
+      if (available.length > 0) {
+        const firstModel = available[0];
+        dm = { provider: firstModel.provider, id: firstModel.id };
+        state.setSettings({ defaultModel: dm });
+        console.log("[applySettingsToSession] auto-selected default model:", dm);
+      }
+    }
+    if (isValidModelRef(dm)) {
+      await switchModel(sessionId, dm.provider, dm.id, { silent: true });
     }
     // Apply default thinking level
     try {
@@ -441,7 +576,7 @@ export default function App() {
         : "Please always respond in English.";
       await steer(sessionId, langMsg);
     } catch (e) { console.error("Failed to apply language instruction:", e); }
-  }, [updateSessionModel, updateSessionThinkingLevel]);
+  }, [updateSessionThinkingLevel]);
 
   // ── New session (fresh) ──
   const handleNewSession = useCallback(async (optCwd?: string, workspaceCwd?: string) => {
@@ -553,9 +688,12 @@ export default function App() {
     appendTimeline({ type: "user", ...userMsg } as TimelineItem);
     updateStatus(activeId, "streaming");
 
-    // Switch to vision model if images are attached
+    // Switch to the configured role before Pi starts the corresponding work.
     if (images && images.length > 0) {
       await switchToRole("vision");
+    } else if (/^\/skill:[^\s]+(?:\s|$)/i.test(text.trim())) {
+      // Pi expands /skill:name commands before the agent run.
+      await switchToRole("skills");
     }
 
     // Auto-name session from first user message (in-memory only, not persisted)
@@ -570,6 +708,29 @@ export default function App() {
     clearInput();
     try {
       await piPrompt(activeId, text, images);
+      // Timeout guard: if no agent event arrives within 120s, restore to idle.
+      // Any pi activity (thinking, tool calls, text) resets the clock via lastEventRef.
+      lastEventRef.current = Date.now();
+      const checkTimeout = () => {
+        const s = usePiDeskStore.getState();
+        const sess = s.sessions[activeId];
+        if (!sess || sess.status !== "streaming") return; // done or aborted
+        const idleMs = Date.now() - lastEventRef.current;
+        if (idleMs > 120_000) {
+          updateStatus(activeId, "idle");
+          const t = getT(s.language);
+          s.addToast({
+            type: "error",
+            title: t("toast", "timeout"),
+            message: t("toast", "timeoutMsg"),
+            durationMs: 10000,
+          });
+        } else {
+          // Still streaming with recent activity — re-check in a moment
+          setTimeout(checkTimeout, Math.min(5000, 120_000 - idleMs + 100));
+        }
+      };
+      setTimeout(checkTimeout, 5000);
     } catch (e) {
       updateStatus(activeId, "idle");
       appendTimeline({ type: "system-info", text: `Error: ${String(e)}`, timestamp: Date.now() });
@@ -639,11 +800,10 @@ export default function App() {
   const handleChangeModel = useCallback(async (provider: string, modelId: string) => {
     const s = usePiDeskStore.getState();
     if (!s.activeSessionId) return;
-    s.updateSessionModel(s.activeSessionId, provider, modelId);
     // Only call Pi if a specific model is selected (not "Auto")
-    if (provider && modelId) {
-      try { await setModel(s.activeSessionId, provider, modelId); } catch (e) { console.error("setModel failed:", e); }
-    }
+    if (!isValidModelRef({ provider, id: modelId })) return;
+    const sid = s.activeSessionId;
+    await switchModel(sid, provider, modelId);
   }, []);
 
   const handleChangeThinking = useCallback(async (level: string) => {
@@ -674,12 +834,12 @@ export default function App() {
     const interval = setInterval(async () => {
       const s = usePiDeskStore.getState();
       for (const [id, session] of Object.entries(s.sessions)) {
-        if (session.status !== "idle") continue;
+        if (session.status !== "idle" && session.status !== "exited") continue;
         try {
           const alive = await checkPiHealth(id);
-          if (!alive) {
-            s.updateSessionStatus(id, "idle");
-            s.setCurrentRole("main");
+          if (!alive && session.status === "idle") {
+            s.updateSessionStatus(id, "exited");
+            setExitedSessions(prev => new Set(prev).add(id));
           }
         } catch { /* ignore */ }
       }
@@ -699,6 +859,37 @@ export default function App() {
     }
   }, [language]);
 
+  // ── Boot Phase: Diagnostics ──
+  if (bootPhase === "diagnostics") {
+    return (
+      <StartupDiagnosticsPanel
+        onRetry={() => setBootPhase("diagnostics")}
+        onContinueAnyway={() => {
+          // Check if first run (no default model configured)
+          const s = usePiDeskStore.getState();
+          if (!s.settings.defaultModel) {
+            setBootPhase("wizard");
+          } else {
+            setBootPhase("ready");
+          }
+        }}
+      />
+    );
+  }
+
+  // ── Boot Phase: Setup Wizard ──
+  if (bootPhase === "wizard") {
+    return (
+      <SetupWizard
+        onComplete={() => setBootPhase("ready")}
+      />
+    );
+  }
+
+  // ── Main App UI ──
+  const activeSession = activeId ? usePiDeskStore.getState().sessions[activeId] : null;
+  const isExited = activeId ? exitedSessions.has(activeId) : false;
+
   return (
     <div className="h-screen flex flex-col bg-surface">
       <TopBar
@@ -715,6 +906,21 @@ export default function App() {
           />
         )}
         <div className="flex-1 flex flex-col min-w-0">
+          {/* Pi process recovery banner */}
+          {isExited && activeSession && (
+            <div className="flex items-center justify-between px-4 py-2 bg-red-900/40 border-b border-red-800">
+              <span className="text-sm text-red-300">
+                Pi process has exited. The session cannot continue until restarted.
+              </span>
+              <button
+                onClick={() => handleRestartSession(activeSession.id)}
+                disabled={restartingSession === activeSession.id}
+                className="px-3 py-1 text-xs font-medium bg-red-700 hover:bg-red-600 text-white rounded disabled:opacity-50"
+              >
+                {restartingSession === activeSession.id ? "Restarting..." : "Restart Pi Kernel"}
+              </button>
+            </div>
+          )}
           <ErrorBoundary name="Conversation">
             <Conversation />
             <Composer onSend={handleSend} onAbort={handleAbort} />

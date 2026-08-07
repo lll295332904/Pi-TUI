@@ -69,6 +69,10 @@ fn get_pi_agent_dir() -> std::path::PathBuf {
 
 #[tauri::command]
 pub fn get_available_models() -> Result<Vec<AvailableModel>, String> {
+    // Keep pi's models.json in sync so providers added via PiDesk
+    // (models-store.json with checkedAt == null) are usable by the pi process.
+    let _ = sync_models_json();
+
     let models_store = get_pi_agent_dir().join("models-store.json");
     if !models_store.exists() {
         return Ok(vec![]);
@@ -146,10 +150,16 @@ pub async fn set_model(
     session_id: String,
     provider: String,
     model_id: String,
+    id: Option<String>,
 ) -> Result<(), String> {
+    // Reject invalid model IDs to prevent "Model not found: provider/undefined" errors
+    if model_id.is_empty() || model_id == "undefined" || model_id == "null" {
+        return Err(format!("Invalid model ID: '{}'. Please select a model in Settings → Model.", model_id));
+    }
     send_cmd!(state, session_id, PiRequest::SetModel {
         provider,
         model: model_id,
+        id,
     })
 }
 
@@ -334,6 +344,95 @@ pub fn list_pi_files() -> Result<Vec<String>, String> {
 
 // ── Add model to models-store ──
 
+/// Sync PiDesk-managed providers (models-store.json entries with
+/// `checkedAt == null`, i.e. added by PiDesk, not refreshed by pi) into
+/// pi's `models.json` so the pi process actually knows these providers.
+/// pi's available models = builtin providers + models.json providers;
+/// models-store.json alone is only a catalog cache and is not enough.
+fn sync_models_json() -> Result<(), String> {
+    let agent_dir = get_pi_agent_dir();
+    let store_path = agent_dir.join("models-store.json");
+    let models_json_path = agent_dir.join("models.json");
+
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let store: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&store_path)
+            .map_err(|e| format!("Cannot read models-store.json: {}", e))?,
+    )
+    .map_err(|e| format!("Invalid models-store.json: {}", e))?;
+
+    // Keep any user-manual provider config already present in models.json.
+    let mut models_json: serde_json::Value = if models_json_path.exists() {
+        std::fs::read_to_string(&models_json_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or(serde_json::json!({ "providers": {} }))
+    } else {
+        serde_json::json!({ "providers": {} })
+    };
+    if !models_json.is_object() {
+        models_json = serde_json::json!({ "providers": {} });
+    }
+    let providers = models_json
+        .get_mut("providers")
+        .and_then(|p| p.as_object_mut());
+    if providers.is_none() {
+        models_json["providers"] = serde_json::json!({});
+    }
+    let providers = models_json["providers"].as_object_mut().unwrap();
+
+    if let Some(store_obj) = store.as_object() {
+        for (pid, entry) in store_obj {
+            let checked_at = entry.get("checkedAt");
+            let managed = checked_at.map(|v| v.is_null()).unwrap_or(true);
+            let models = entry.get("models").and_then(|m| m.as_array());
+            let has_models = models.map(|a| !a.is_empty()).unwrap_or(false);
+            if !managed || !has_models {
+                continue;
+            }
+            let model_list = models.unwrap();
+            let models_defs: Vec<serde_json::Value> = model_list
+                .iter()
+                .map(|m| {
+                    let mut def = serde_json::Map::new();
+                    for key in [
+                        "id", "name", "api", "baseUrl", "reasoning",
+                        "thinkingLevelMap", "input", "cost", "contextWindow",
+                        "maxTokens", "compat",
+                    ] {
+                        if let Some(v) = m.get(key) {
+                            def.insert(key.to_string(), v.clone());
+                        }
+                    }
+                    serde_json::Value::Object(def)
+                })
+                .collect();
+
+            let mut p = serde_json::Map::new();
+            p.insert("name".to_string(), serde_json::json!(pid));
+            if let Some(b) = model_list.first().and_then(|m| m.get("baseUrl")).cloned() {
+                p.insert("baseUrl".to_string(), b);
+            }
+            if let Some(a) = model_list.first().and_then(|m| m.get("api")).cloned() {
+                p.insert("api".to_string(), a);
+            }
+            if let Some(c) = model_list.first().and_then(|m| m.get("compat")).cloned() {
+                p.insert("compat".to_string(), c);
+            }
+            p.insert("models".to_string(), serde_json::Value::Array(models_defs));
+            providers.insert(pid.clone(), serde_json::Value::Object(p));
+        }
+    }
+
+    let updated = serde_json::to_string_pretty(&models_json)
+        .map_err(|e| format!("Serialize models.json error: {}", e))?;
+    std::fs::write(&models_json_path, updated)
+        .map_err(|e| format!("Cannot write models.json: {}", e))?;
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct NewModelParams {
     pub provider: String,
@@ -489,6 +588,9 @@ pub fn add_model(params: NewModelParams) -> Result<(), String> {
         }
     }
 
+    // Register PiDesk-managed providers in pi's models.json
+    let _ = sync_models_json();
+
     Ok(())
 }
 
@@ -519,7 +621,12 @@ pub fn remove_model(provider: String, model_id: String) -> Result<(), String> {
     let updated = serde_json::to_string_pretty(&store)
         .map_err(|e| format!("Serialize error: {}", e))?;
     std::fs::write(&models_path, &updated)
-        .map_err(|e| format!("Cannot write: {}", e))
+        .map_err(|e| format!("Cannot write: {}", e))?;
+
+    // Re-sync models.json after removing a model
+    let _ = sync_models_json();
+
+    Ok(())
 }
 
 // ── Fetch models from OpenAI-compatible API ──
@@ -548,7 +655,18 @@ pub async fn fetch_models_from_url(base_url: String, api_key: Option<String>) ->
     }
 
     let resp = req.send().await.map_err(|e| format!("HTTP request failed: {}", e))?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("JSON parse failed: {}", e))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("Failed to read response body: {}", e))?;
+
+    if !status.is_success() {
+        let snippet = if text.len() > 500 { &text[..500] } else { &text };
+        return Err(format!("HTTP {} from {}: {}", status.as_u16(), url, snippet));
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        let snippet = if text.len() > 500 { &text[..500] } else { &text };
+        format!("JSON parse failed: {} — response body: {}", e, snippet)
+    })?;
 
     let data = body.get("data")
         .and_then(|d| d.as_array())
