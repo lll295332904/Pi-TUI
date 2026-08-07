@@ -2,6 +2,48 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { PiOutboundEvent, ThinkingLevel, PiSessionMeta, SessionEntryVm, AvailableModel } from "./types";
 
+export interface AppErrorDto {
+  code: string;
+  message: string;
+  recoverable: boolean;
+  actionLabel?: string;
+  actionCommand?: string;
+}
+
+export function getAppError(error: unknown): AppErrorDto | null {
+  if (typeof error === "object" && error !== null && "message" in error && "code" in error) {
+    const maybe = error as Partial<AppErrorDto>;
+    if (typeof maybe.message === "string" && typeof maybe.code === "string") {
+      return error as AppErrorDto;
+    }
+  }
+  if (error instanceof Error && "appError" in error) {
+    return (error as Error & { appError?: AppErrorDto }).appError ?? null;
+  }
+  return null;
+}
+
+function toAppError(error: unknown): Error {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const maybe = error as { message?: unknown; code?: unknown };
+    if (typeof maybe.message === "string") {
+      const err = new Error(maybe.message) as Error & { code?: string; appError?: AppErrorDto };
+      if (typeof maybe.code === "string") err.code = maybe.code;
+      err.appError = error as AppErrorDto;
+      return err;
+    }
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+async function invokeSafe<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (error) {
+    throw toAppError(error);
+  }
+}
+
 // ── Commands (Renderer → Main) ──
 
 export async function startSession(opts: {
@@ -9,41 +51,41 @@ export async function startSession(opts: {
   provider?: string;
   model?: string;
 }): Promise<string> {
-  return invoke<string>("start_session", { opts });
+  return invokeSafe<string>("start_session", { opts });
 }
 
 export async function stopSession(sessionId: string): Promise<void> {
-  return invoke("stop_session", { sessionId });
+  return invokeSafe("stop_session", { sessionId });
 }
 
 export async function prompt(sessionId: string, message: string, images?: string[]): Promise<void> {
-  return invoke("prompt", { sessionId, message, images: images ?? [] });
+  return invokeSafe("prompt", { sessionId, message, images: images ?? [] });
 }
 
 export async function steer(sessionId: string, message: string): Promise<void> {
-  return invoke("steer", { sessionId, message });
+  return invokeSafe("steer", { sessionId, message });
 }
 
 export async function newPiSession(sessionId: string): Promise<void> {
-  return invoke("new_session", { sessionId });
+  return invokeSafe("new_session", { sessionId });
 }
 
 export async function followUp(sessionId: string, message: string): Promise<void> {
-  return invoke("follow_up", { sessionId, message });
+  return invokeSafe("follow_up", { sessionId, message });
 }
 
 export async function abortSession(sessionId: string): Promise<void> {
-  return invoke("abort", { sessionId });
+  return invokeSafe("abort", { sessionId });
 }
 
 // ── Model & Thinking ──
 
 export async function getAvailableModels(): Promise<AvailableModel[]> {
-  return invoke<AvailableModel[]>("get_available_models");
+  return invokeSafe<AvailableModel[]>("get_available_models");
 }
 
 export async function getThinkingLevels(provider: string, modelId: string): Promise<string[]> {
-  return invoke<string[]>("get_thinking_levels", { provider, modelId });
+  return invokeSafe<string[]>("get_thinking_levels", { provider, modelId });
 }
 
 // ── Model & Thinking ──
@@ -96,7 +138,6 @@ export async function setModel(sessionId: string, provider: string, modelId: str
       clearTimeout(timer);
       pendingSetModel.delete(id);
     };
-    // If pi never answers (e.g. process exited), don't hang the caller forever.
     const timer = setTimeout(() => {
       settle();
       reject(new Error(`Model switch timed out for ${provider}/${modelId}`));
@@ -107,12 +148,13 @@ export async function setModel(sessionId: string, provider: string, modelId: str
       reject: (err) => { settle(); reject(err); },
       settle,
     });
-    invoke("set_model", { sessionId, provider, modelId, id }).catch((e) => {
+    invokeSafe("set_model", { sessionId, provider, modelId, id }).catch((e) => {
       settle();
       reject(e instanceof Error ? e : new Error(String(e)));
     });
   });
 }
+
 
 /**
  * Strict validator for a model reference. Returns false for null/undefined,
@@ -129,25 +171,25 @@ export function isValidModelRef(ref: { provider?: unknown; id?: unknown } | null
 }
 
 export async function setThinkingLevel(sessionId: string, level: ThinkingLevel): Promise<void> {
-  return invoke("set_thinking_level", { sessionId, level });
+  return invokeSafe("set_thinking_level", { sessionId, level });
 }
 
 // ── Steering / FollowUp / Compaction / Retry ──
 
 export async function setSteeringMode(sessionId: string, mode: "all" | "one-at-a-time"): Promise<void> {
-  return invoke("set_steering_mode", { sessionId, mode });
+  return invokeSafe("set_steering_mode", { sessionId, mode });
 }
 
 export async function setFollowUpMode(sessionId: string, mode: "all" | "one-at-a-time"): Promise<void> {
-  return invoke("set_follow_up_mode", { sessionId, mode });
+  return invokeSafe("set_follow_up_mode", { sessionId, mode });
 }
 
 export async function setAutoCompaction(sessionId: string, enabled: boolean): Promise<void> {
-  return invoke("set_auto_compaction", { sessionId, enabled });
+  return invokeSafe("set_auto_compaction", { sessionId, enabled });
 }
 
 export async function setAutoRetry(sessionId: string, enabled: boolean): Promise<void> {
-  return invoke("set_auto_retry", { sessionId, enabled });
+  return invokeSafe("set_auto_retry", { sessionId, enabled });
 }
 
 // ── Extension UI Response ──
@@ -157,7 +199,7 @@ export async function respondExtensionUi(
   requestId: string,
   response: Record<string, unknown>,
 ): Promise<void> {
-  return invoke("respond_extension_ui", { sessionId, requestId, response });
+  return invokeSafe("respond_extension_ui", { sessionId, requestId, response });
 }
 
 // ── Session entries ──
@@ -166,67 +208,67 @@ export async function getEntries(
   sessionId: string,
   since?: string
 ): Promise<void> {
-  return invoke("get_entries", { sessionId, since: since ?? null });
+  return invokeSafe("get_entries", { sessionId, since: since ?? null });
 }
 
 export async function getTree(
   sessionId: string
 ): Promise<void> {
-  return invoke("get_tree", { sessionId });
+  return invokeSafe("get_tree", { sessionId });
 }
 
 export async function forkSession(sessionId: string, entryId: string): Promise<void> {
-  return invoke("fork", { sessionId, entryId });
+  return invokeSafe("fork", { sessionId, entryId });
 }
 
 export async function switchSession(sessionId: string, path: string): Promise<void> {
-  return invoke("switch_session", { sessionId, path });
+  return invokeSafe("switch_session", { sessionId, path });
 }
 
 export async function bash(sessionId: string, cmd: string): Promise<void> {
-  return invoke("bash_exec", { sessionId, command: cmd });
+  return invokeSafe("bash_exec", { sessionId, command: cmd });
 }
 
 export async function compactSession(sessionId: string): Promise<void> {
-  return invoke("compact", { sessionId });
+  return invokeSafe("compact", { sessionId });
 }
 
 export async function exportHtml(sessionId: string, out?: string): Promise<{ path: string }> {
-  return invoke("export_html", { sessionId, out: out ?? null });
+  return invokeSafe("export_html", { sessionId, out: out ?? null });
 }
 
 // ── Pi version ──
 
 export async function getPiVersion(): Promise<string> {
-  return invoke<string>("get_pi_version");
+  return invokeSafe<string>("get_pi_version");
 }
 
 export async function locatePi(): Promise<{ path: string; version: string }> {
-  return invoke<{ path: string; version: string }>("locate_pi");
+  return invokeSafe<{ path: string; version: string }>("locate_pi");
 }
 
 // ── Session persistence ──
 
 export async function listPiSessions(): Promise<PiSessionMeta[]> {
-  return invoke<PiSessionMeta[]>("list_pi_sessions");
+  return invokeSafe<PiSessionMeta[]>("list_pi_sessions");
 }
 
 export async function loadSessionEntries(sessionId: string): Promise<SessionEntryVm[]> {
-  return invoke<SessionEntryVm[]>("load_session_entries", { sessionId });
+  return invokeSafe<SessionEntryVm[]>("load_session_entries", { sessionId });
 }
 
 // ── Pi config files ──
 
 export async function readPiFile(filename: string): Promise<string> {
-  return invoke<string>("read_pi_file", { filename });
+  return invokeSafe<string>("read_pi_file", { filename });
 }
 
 export async function writePiFile(filename: string, content: string): Promise<void> {
-  return invoke("write_pi_file", { filename, content });
+  return invokeSafe("write_pi_file", { filename, content });
 }
 
 export async function listPiFiles(): Promise<string[]> {
-  return invoke<string[]>("list_pi_files");
+  return invokeSafe<string[]>("list_pi_files");
 }
 
 // ── Add model ──
@@ -245,7 +287,7 @@ export interface NewModelParams {
 }
 
 export async function addModel(params: NewModelParams): Promise<void> {
-  return invoke("add_model", {
+  return invokeSafe("add_model", {
     params: {
       provider: params.provider,
       model_id: params.modelId,
@@ -262,7 +304,7 @@ export async function addModel(params: NewModelParams): Promise<void> {
 }
 
 export async function removeModel(provider: string, modelId: string): Promise<void> {
-  return invoke("remove_model", { provider, modelId });
+  return invokeSafe("remove_model", { provider, modelId });
 }
 
 export interface FetchedModel {
@@ -271,31 +313,31 @@ export interface FetchedModel {
 }
 
 export async function fetchModelsFromUrl(baseUrl: string, apiKey?: string): Promise<FetchedModel[]> {
-  return invoke<FetchedModel[]>("fetch_models_from_url", { baseUrl, apiKey });
+  return invokeSafe<FetchedModel[]>("fetch_models_from_url", { baseUrl, apiKey });
 }
 
 export async function deletePiSession(sessionId: string): Promise<void> {
-  return invoke("delete_pi_session", { sessionId });
+  return invokeSafe("delete_pi_session", { sessionId });
 }
 
 export async function saveUserdata(data: Record<string, unknown>): Promise<void> {
-  return invoke("save_userdata", { data });
+  return invokeSafe("save_userdata", { data });
 }
 
 export async function loadUserdata(): Promise<Record<string, unknown>> {
-  return invoke<Record<string, unknown>>("load_userdata");
+  return invokeSafe<Record<string, unknown>>("load_userdata");
 }
 
 export async function getSessionsDir(): Promise<string> {
-  return invoke<string>("get_sessions_dir");
+  return invokeSafe<string>("get_sessions_dir");
 }
 
 export async function checkPiHealth(sessionId: string): Promise<boolean> {
-  return invoke<boolean>("check_pi_health", { sessionId });
+  return invokeSafe<boolean>("check_pi_health", { sessionId });
 }
 
 export async function restartSession(sessionId: string, cwd: string): Promise<void> {
-  return invoke("restart_session", { sessionId, cwd });
+  return invokeSafe("restart_session", { sessionId, cwd });
 }
 
 // ── Startup Diagnostics ──
@@ -317,11 +359,11 @@ export interface StartupDiagnostics {
 }
 
 export async function runStartupDiagnostics(): Promise<StartupDiagnostics> {
-  return invoke<StartupDiagnostics>("run_startup_diagnostics");
+  return invokeSafe<StartupDiagnostics>("run_startup_diagnostics");
 }
 
 export async function exportDiagnostics(): Promise<string> {
-  return invoke<string>("export_diagnostics");
+  return invokeSafe<string>("export_diagnostics");
 }
 
 // ── Events (Main → Renderer) ──

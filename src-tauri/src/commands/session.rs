@@ -1,3 +1,4 @@
+use crate::error::{AppError, AppResult};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,24 +77,24 @@ pub async fn start_session(
     app: AppHandle,
     state: State<'_, AppState>,
     opts: SessionOpts,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let mut kernel = state.kernel.lock().await;
     kernel
         .start_session(app, opts.cwd, opts.provider, opts.model)
         .await
-        .map_err(|e| format!("Failed to start session: {}", e))
+        .map_err(|e| AppError::PiStartFailed { detail: e.to_string() }.into())
 }
 
 #[tauri::command]
 pub async fn stop_session(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut kernel = state.kernel.lock().await;
     kernel
         .stop_session(&session_id)
         .await
-        .map_err(|e| format!("Failed to stop session: {}", e))
+        .map_err(|e| AppError::PiProcessExited { detail: e.to_string() }.into())
 }
 
 #[tauri::command]
@@ -255,17 +256,17 @@ fn parse_session_file_id(session_id: &str) -> (&str, &str) {
 }
 
 #[tauri::command]
-pub fn load_session_entries(session_id: String) -> Result<Vec<SessionEntryVm>, String> {
+pub fn load_session_entries(session_id: String) -> AppResult<Vec<SessionEntryVm>> {
     let (dir_name, file_name) = parse_session_file_id(&session_id);
     let sessions_dir = get_pi_sessions_dir();
     let file_path = sessions_dir.join(dir_name).join(file_name);
 
     if !file_path.exists() {
-        return Err(format!("Session file not found: {}", file_path.display()));
+        return Err(AppError::SessionFileNotFound { detail: file_path.display().to_string() }.into());
     }
 
-    let content =
-        std::fs::read_to_string(&file_path).map_err(|e| format!("Cannot read file: {}", e))?;
+    let content = std::fs::read_to_string(&file_path)
+        .map_err(|e| AppError::ConfigReadFailed { detail: e.to_string() })?;
 
     let mut entries: Vec<SessionEntryVm> = Vec::new();
 
@@ -274,8 +275,8 @@ pub fn load_session_entries(session_id: String) -> Result<Vec<SessionEntryVm>, S
             continue;
         }
 
-        let val: Value =
-            serde_json::from_str(line).map_err(|e| format!("JSON parse error: {}", e))?;
+        let val: Value = serde_json::from_str(line)
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("JSON parse error: {}", e) })?;
 
         let entry_type = val
             .get("type")
@@ -358,11 +359,11 @@ pub fn load_session_entries(session_id: String) -> Result<Vec<SessionEntryVm>, S
 
 /// Delete a single .jsonl session file. Cleans up the directory if it becomes empty.
 #[tauri::command]
-pub fn delete_pi_session(session_id: String) -> Result<(), String> {
+pub fn delete_pi_session(session_id: String) -> AppResult<()> {
     let (dir_name, file_name) = parse_session_file_id(&session_id);
 
     if file_name.is_empty() {
-        return Err("Invalid session ID format".to_string());
+        return Err(AppError::SessionFileNotFound { detail: "Invalid session ID format".into() }.into());
     }
 
     let sessions_dir = get_pi_sessions_dir();
@@ -370,7 +371,7 @@ pub fn delete_pi_session(session_id: String) -> Result<(), String> {
 
     if file_path.exists() {
         std::fs::remove_file(&file_path)
-            .map_err(|e| format!("Cannot delete session file: {}", e))?;
+            .map_err(|e| AppError::ConfigWriteFailed { detail: e.to_string() })?;
     }
 
     // Clean up directory if empty
@@ -413,10 +414,10 @@ pub async fn restart_session(
     state: State<'_, AppState>,
     session_id: String,
     cwd: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut kernel = state.kernel.lock().await;
     kernel
         .restart_session(app, &session_id, &cwd)
         .await
-        .map_err(|e| format!("Failed to restart session: {}", e))
+        .map_err(|e| AppError::PiStartFailed { detail: e.to_string() }.into())
 }

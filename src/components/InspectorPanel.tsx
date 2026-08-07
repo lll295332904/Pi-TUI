@@ -1,6 +1,7 @@
 import { useMemo } from "react";
-import { X, Clock, FolderOpen, Activity, Wrench, Cpu } from "lucide-react";
+import { X, Clock, FolderOpen, Activity, Wrench, Cpu, Sparkles, SquareSlash } from "lucide-react";
 import { usePiDeskStore } from "../store/pidesk";
+import { compactSession } from "../bridge";
 import type { TimelineItem } from "../types";
 import { useT } from "../i18n";
 
@@ -30,14 +31,17 @@ export default function InspectorPanel() {
   const sessions = usePiDeskStore((s) => s.sessions);
   const timelines = usePiDeskStore((s) => s.sessionTimelines);
   const sessionUsage = usePiDeskStore((s) => s.sessionUsage);
+  const sessionContextUsage = usePiDeskStore((s) => s.sessionContextUsage);
   const currentRole = usePiDeskStore((s) => (s.activeSessionId && s.sessionRoles[s.activeSessionId]) || s.globalRole);
 
   const session = activeId ? sessions[activeId] : null;
   const timeline = activeId ? (timelines[activeId] || []) : [];
   const usage = activeId ? (sessionUsage[activeId] || { inputTokens: 0, outputTokens: 0 }) : { inputTokens: 0, outputTokens: 0 };
+  const contextUsage = activeId ? (sessionContextUsage[activeId] || { usedTokens: 0, maxTokens: 0 }) : { usedTokens: 0, maxTokens: 0 };
 
   // I/O 比例（输入 / 输出）。outputTokens 为 0 时无法计算，显示占位符避免除零。
   const ioRatio = usage.outputTokens > 0 ? usage.inputTokens / usage.outputTokens : null;
+  const contextPercent = contextUsage.maxTokens > 0 ? Math.min(100, (contextUsage.usedTokens / contextUsage.maxTokens) * 100) : 0;
   const ratioExceeded = ioRatio !== null && ioRatio > IO_RATIO_UPPER_LIMIT;
 
   const toolCalls = useMemo(() => {
@@ -121,6 +125,30 @@ export default function InspectorPanel() {
             {ratioExceeded && (
               <div className="text-[10px] text-red-500">{t("ioRatioExceeded", { limit: String(IO_RATIO_UPPER_LIMIT) })}</div>
             )}
+          </div>
+        </section>
+
+        <section>
+          <div className="text-[10px] text-muted font-medium mb-1 uppercase flex items-center gap-1"><Sparkles size={10} /> {t("context")}</div>
+          <div className="space-y-1 bg-gray-50 rounded p-1.5">
+            <div className="flex justify-between">
+              <span className="text-muted">{t("contextUsage")}</span>
+              <span className="text-gray-700 font-medium">{contextUsage.usedTokens.toLocaleString()} / {contextUsage.maxTokens.toLocaleString()}</span>
+            </div>
+            <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+              <div className={`h-full ${contextPercent >= 90 ? "bg-red-500" : contextPercent >= 70 ? "bg-yellow-500" : "bg-accent"}`} style={{ width: `${contextPercent}%` }} />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] text-muted">{t("contextPercent", { percent: contextUsage.maxTokens > 0 ? String(Math.round(contextPercent)) : "0" })}</span>
+              <button
+                onClick={() => { if (activeId) compactSession(activeId).catch(console.error); }}
+                className="inline-flex items-center gap-1 text-[10px] font-medium text-accent hover:text-accent/80"
+                title={t("compactContext")}
+              >
+                <SquareSlash size={10} />
+                {t("compactContext")}
+              </button>
+            </div>
           </div>
         </section>
 

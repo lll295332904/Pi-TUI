@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { usePiDeskStore } from "../store/pidesk";
-import { fetchModelsFromUrl, addModel, getAvailableModels } from "../bridge";
+import { fetchModelsFromUrl, addModel, getAvailableModels, getAppError } from "../bridge";
 import type { FetchedModel } from "../bridge";
 import { ArrowRight, ArrowLeft, Check, AlertTriangle, Loader2, FolderOpen, Globe, Zap } from "lucide-react";
 
@@ -74,13 +74,14 @@ export default function SetupWizard({ onComplete }: Props) {
       setSelectAll(true);
       setSelectedModels(new Set(models.map(m => m.id)));
       setTestStatus("success");
-    } catch (e: any) {
-      const msg = String(e);
-      if (msg.includes("401") || msg.includes("403")) {
+    } catch (e) {
+      const appError = getAppError(e);
+      if (appError?.code === "PROVIDER_AUTH_FAILED") {
         setTestError("Authentication failed. Check your API Key.");
-      } else if (msg.includes("404") || msg.includes("ENOTFOUND") || msg.includes("Connection")) {
+      } else if (appError?.code === "PROVIDER_NETWORK_FAILED") {
         setTestError("Cannot reach the server. Check your Base URL.");
       } else {
+        const msg = appError?.message ?? String(e);
         setTestError(msg.slice(0, 200));
       }
       setTestStatus("failed");

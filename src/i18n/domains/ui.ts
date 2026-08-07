@@ -65,6 +65,7 @@ export const toast = {
     modelSwitchFailed: "模型切换失败，仍使用原模型，请检查 设置 → 模型：",
     timeout: "超时",
     timeoutMsg: "Pi 在 120 秒内无任何输出 — 模型可能未正确配置或网络不稳定，请检查 设置 → 模型。",
+    openSettings: "打开设置",
   },
   en: {
     taskCompleted: "Task completed",
@@ -75,6 +76,7 @@ export const toast = {
     modelSwitchFailed: "Model switch failed, still using the previous model. Check Settings → Model:",
     timeout: "Timeout",
     timeoutMsg: "No output from Pi within 120s — the model may not be configured correctly or the network is unstable. Check Settings → Model.",
+    openSettings: "Open Settings",
   },
 };
 
@@ -216,6 +218,10 @@ export const inspector = {
     inputTokens: "输入",
     outputTokens: "输出",
     totalTokens: "总计",
+    context: "上下文",
+    contextUsage: "上下文用量",
+    contextPercent: "已使用 {percent}%",
+    compactContext: "主动压缩上下文",
     agent: "AGENT",
     role: "角色",
     roleMain: "主代理 (处理对话, 使用工具)",
@@ -260,6 +266,10 @@ export const inspector = {
     inputTokens: "Input",
     outputTokens: "Output",
     totalTokens: "Total",
+    context: "Context",
+    contextUsage: "Context Usage",
+    contextPercent: "Used {percent}%",
+    compactContext: "Compact Context",
     agent: "AGENT",
     role: "Role",
     roleMain: "Main agent (handles conversation, uses tools)",

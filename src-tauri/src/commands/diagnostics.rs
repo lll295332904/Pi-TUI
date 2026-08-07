@@ -1,4 +1,6 @@
+use crate::AppState;
 use serde::Serialize;
+use tauri::State;
 
 /// A single diagnostic check result
 #[derive(Debug, Clone, Serialize)]
@@ -165,13 +167,21 @@ fn run_startup_diagnostics_impl() -> StartupDiagnostics {
 
 /// Run startup diagnostics and return structured report.
 #[tauri::command]
-pub fn run_startup_diagnostics() -> StartupDiagnostics {
-    run_startup_diagnostics_impl()
+pub fn run_startup_diagnostics(state: State<'_, AppState>) -> StartupDiagnostics {
+    state.logger.info("Startup diagnostics started");
+    let result = run_startup_diagnostics_impl();
+    if result.ok {
+        state.logger.info("Startup diagnostics passed");
+    } else {
+        state.logger.warn(&format!("Startup diagnostics failed: {} errors", result.errors.len()));
+    }
+    result
 }
 
 /// Export diagnostic bundle as a text report. Returns the file path.
 #[tauri::command]
-pub fn export_diagnostics() -> Result<String, String> {
+pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    state.logger.info("Diagnostic report export started");
     let diag = run_startup_diagnostics_impl();
     let log_dir = {
         let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
@@ -225,5 +235,6 @@ pub fn export_diagnostics() -> Result<String, String> {
     }
 
     std::fs::write(&export_path, &report).map_err(|e| format!("Failed to write: {}", e))?;
+    state.logger.info(&format!("Diagnostic report exported to {}", export_path.display()));
     Ok(export_path.to_string_lossy().to_string())
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { runStartupDiagnostics } from "../bridge";
+import { exportDiagnostics, runStartupDiagnostics } from "../bridge";
 import type { StartupDiagnostics } from "../bridge";
 import { AlertTriangle, CheckCircle, Copy, RefreshCw, XCircle } from "lucide-react";
 
@@ -28,6 +28,7 @@ export default function StartupDiagnosticsPanel({ onRetry, onContinueAnyway }: P
   const [diag, setDiag] = useState<StartupDiagnostics | null>(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [exported, setExported] = useState(false);
 
   useEffect(() => {
     runDiagnostics();
@@ -45,6 +46,16 @@ export default function StartupDiagnosticsPanel({ onRetry, onContinueAnyway }: P
       setDiag(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function exportDiagnosticReport() {
+    try {
+      await exportDiagnostics();
+      setExported(true);
+      setTimeout(() => setExported(false), 2000);
+    } catch {
+      setExported(false);
     }
   }
 
@@ -173,13 +184,21 @@ export default function StartupDiagnosticsPanel({ onRetry, onContinueAnyway }: P
 
       {/* Actions */}
       <div className="flex items-center justify-between p-4 border-t border-zinc-800 bg-zinc-900/50">
-        <button
-          onClick={copyDiagnostics}
-          className="flex items-center gap-2 px-3 py-1.5 text-xs text-zinc-400 hover:text-white bg-zinc-800 rounded hover:bg-zinc-700"
-        >
-          <Copy size={12} />
-          {copied ? "Copied!" : "Copy Diagnostics"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={copyDiagnostics}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs text-zinc-400 hover:text-white bg-zinc-800 rounded hover:bg-zinc-700"
+          >
+            <Copy size={12} />
+            {copied ? "Copied!" : "Copy Diagnostics"}
+          </button>
+          <button
+            onClick={exportDiagnosticReport}
+            className="px-3 py-1.5 text-xs text-zinc-400 hover:text-white bg-zinc-800 rounded hover:bg-zinc-700"
+          >
+            {exported ? "Exported" : "Export Report"}
+          </button>
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={onContinueAnyway}

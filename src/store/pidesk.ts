@@ -79,6 +79,7 @@ interface PiDeskState {
   consoleLogs: Record<string, string[]>;  // sessionId → raw event JSON lines
   sessionUsage: Record<string, { inputTokens: number; outputTokens: number }>;
   sessionWorkspaces: Record<string, string>; // cwd → workspaceCwd, persisted
+  sessionContextUsage: Record<string, { usedTokens: number; maxTokens: number }>;
   sessionRoles: Record<string, string>; // sessionId → current role
   globalRole: string; // fallback for TopBar display
 
@@ -104,13 +105,14 @@ interface PiDeskState {
   setAvailableModels: (models: AvailableModel[]) => void;
   updateSessionModel: (id: string, provider: string, modelId: string) => void;
   updateSessionThinkingLevel: (id: string, level: string) => void;
+  setSessionContextUsage: (id: string, usedTokens: number, maxTokens: number) => void;
   // Transient: sessionId → model ref currently being switched to (shown as "Switching…" in TopBar)
   modelSwitching: Record<string, ModelRef>;
   setModelSwitching: (id: string, ref: ModelRef | null) => void;
 
   // Actions – timeline
-  appendTimeline: (item: TimelineItem) => void;
-  updateTimelineItem: (itemId: string, patch: Partial<TimelineItem>) => void;
+  appendTimeline: (item: TimelineItem, sessionId?: string) => void;
+  updateTimelineItem: (itemId: string, patch: Partial<TimelineItem>, sessionId?: string) => void;
   clearTimeline: () => void;
   loadHistoryEntries: (sessionId: string, entries: TimelineItem[]) => void;
   setHistoricalSessions: (list: PiSessionMeta[]) => void;
@@ -179,6 +181,7 @@ export const usePiDeskStore = create<PiDeskState>()(
       consoleLogs: {},
       sessionUsage: {},
       sessionWorkspaces: {},
+      sessionContextUsage: {},
       sessionRoles: {},
       globalRole: "main",
       modelSwitching: {},
@@ -260,6 +263,14 @@ export const usePiDeskStore = create<PiDeskState>()(
           };
         }),
 
+      setSessionContextUsage: (id, usedTokens, maxTokens) =>
+        set((s) => ({
+          sessionContextUsage: {
+            ...s.sessionContextUsage,
+            [id]: { usedTokens, maxTokens },
+          },
+        })),
+
       setModelSwitching: (id, ref) =>
         set((s) => {
           const next = { ...s.modelSwitching };
@@ -268,26 +279,28 @@ export const usePiDeskStore = create<PiDeskState>()(
           return { modelSwitching: next };
         }),
 
-      appendTimeline: (item) =>
+      appendTimeline: (item, sessionId) =>
         set((s) => {
-          if (!s.activeSessionId) return s;
-          const current = s.sessionTimelines[s.activeSessionId] || [];
+          const targetSessionId = sessionId || s.activeSessionId;
+          if (!targetSessionId) return s;
+          const current = s.sessionTimelines[targetSessionId] || [];
           return {
             sessionTimelines: {
               ...s.sessionTimelines,
-              [s.activeSessionId]: [...current, item],
+              [targetSessionId]: [...current, item],
             },
           };
         }),
 
-      updateTimelineItem: (itemId, patch) =>
+      updateTimelineItem: (itemId, patch, sessionId) =>
         set((s) => {
-          if (!s.activeSessionId) return s;
-          const current = s.sessionTimelines[s.activeSessionId] || [];
+          const targetSessionId = sessionId || s.activeSessionId;
+          if (!targetSessionId) return s;
+          const current = s.sessionTimelines[targetSessionId] || [];
           return {
             sessionTimelines: {
               ...s.sessionTimelines,
-              [s.activeSessionId]: current.map((t) => {
+              [targetSessionId]: current.map((t) => {
                 const id = t.type === "tool" ? t.toolCallId : (t as { id: string }).id;
                 if (id === itemId) return { ...t, ...patch } as TimelineItem;
                 return t;
@@ -451,7 +464,7 @@ export const usePiDeskStore = create<PiDeskState>()(
       accumulateUsage: (sessionId, input, output) =>
         set((s) => {
           const prev = s.sessionUsage[sessionId] || { inputTokens: 0, outputTokens: 0 };
-          return {
+          const next = {
             sessionUsage: {
               ...s.sessionUsage,
               [sessionId]: {
@@ -460,6 +473,7 @@ export const usePiDeskStore = create<PiDeskState>()(
               },
             },
           };
+          return next;
         }),
       setInputValue: (v) => set({ inputValue: v }),
       addInputImage: (path) => set((s) => ({ inputImages: [...s.inputImages, path] })),
@@ -491,6 +505,8 @@ export const usePiDeskStore = create<PiDeskState>()(
       name: "pi-desk-storage",
       partialize: (s) => ({
         sessionNames: s.sessionNames,
+        sessionUsage: s.sessionUsage,
+        sessionContextUsage: s.sessionContextUsage,
         settings: s.settings,
         projects: s.projects,
         pinned: s.pinned,
@@ -523,6 +539,8 @@ export const usePiDeskStore = create<PiDeskState>()(
             merged.settings = { ...merged.settings, roleModels: cleaned };
           }
         }
+        if (merged.sessionUsage == null) merged.sessionUsage = {};
+        if (merged.sessionContextUsage == null) merged.sessionContextUsage = {};
         return merged as PiDeskState;
       },
       onRehydrateStorage: () => undefined, // handled in App.tsx useEffect

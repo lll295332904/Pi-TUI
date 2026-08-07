@@ -303,6 +303,8 @@ export interface ToastItem {
   title: string;
   message?: string;
   durationMs?: number; // 0 = sticky
+  actionLabel?: string;
+  actionCommand?: string;
 }
 
 export interface ProjectVM {

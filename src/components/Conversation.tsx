@@ -77,9 +77,9 @@ export default function Conversation() {
           <button onClick={() => usePiDeskStore.getState().setSearchQuery("")} className="ml-2 text-accent hover:underline">clear</button>
         </div>
       )}
-      {visibleTimeline.map((item, i) => (
-        <ItemWrapper key={getItemKey(item, i)}>
-          <TimelineRow item={item} t={t} />
+      {groupTimeline(visibleTimeline).map((group, i) => (
+        <ItemWrapper key={group.kind === "tools" ? `tools-${group.tools[0].toolCallId}` : getItemKey(group.item, i)}>
+          {group.kind === "tools" ? <ToolActivityGroup tools={group.tools} t={t} /> : <TimelineRow item={group.item} t={t} />}
         </ItemWrapper>
       ))}
       <div ref={bottomRef} />
@@ -95,6 +95,24 @@ function getItemKey(item: TimelineItem, idx: number): string {
   if (item.type === "tool") return `tool-${item.toolCallId}`;
   if (item.type === "system-info") return `sys-${idx}`;
   return (item as MessageVM).id;
+}
+
+type TimelineGroup =
+  | { kind: "item"; item: TimelineItem }
+  | { kind: "tools"; tools: ToolCallVM[] };
+
+function groupTimeline(items: TimelineItem[]): TimelineGroup[] {
+  const groups: TimelineGroup[] = [];
+  for (const item of items) {
+    if (item.type === "tool") {
+      const previous = groups[groups.length - 1];
+      if (previous?.kind === "tools") previous.tools.push(item);
+      else groups.push({ kind: "tools", tools: [item] });
+    } else {
+      groups.push({ kind: "item", item });
+    }
+  }
+  return groups;
 }
 
 function TimelineRow({ item, t }: { item: TimelineItem; t: (k: string) => string }) {
@@ -130,6 +148,41 @@ function AssistantBubble({ msg, t }: { msg: MessageVM; t: (k: string) => string 
         {msg.text ? <span className={msg.streaming ? "streaming-cursor" : ""}><ReactMarkdown remarkPlugins={[remarkBreaks]}>{msg.text}</ReactMarkdown></span>
         : msg.streaming ? <span className="text-muted italic">{t("thinking_")}</span> : null}
       </div>
+    </div>
+  );
+}
+
+function ToolActivityGroup({ tools, t }: { tools: ToolCallVM[]; t: (k: string) => string }) {
+  const [expanded, setExpanded] = useState(false);
+  const running = tools.filter((tool) => tool.state === "running").length;
+  const errors = tools.filter((tool) => tool.isError).length;
+  const latest = tools[tools.length - 1];
+  const statusText = running > 0
+    ? `${running} running`
+    : errors > 0
+      ? `${errors} failed`
+      : `${tools.length} completed`;
+
+  return (
+    <div className="border border-border rounded-md bg-surface-secondary text-sm overflow-hidden">
+      <button
+        onClick={() => setExpanded((value) => !value)}
+        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-black/5 transition-colors"
+        aria-expanded={expanded}
+      >
+        {running > 0 ? <Loader size={14} className="text-accent animate-spin shrink-0" /> : errors > 0 ? <X size={14} className="text-danger shrink-0" /> : <Check size={14} className="text-success shrink-0" />}
+        <Wrench size={14} className="text-muted shrink-0" />
+        <span className="font-medium text-gray-700">Tools</span>
+        <span className="text-xs text-muted">{tools.length} calls</span>
+        <span className="text-xs text-muted truncate flex-1">{latest ? `${latest.toolName} ${formatToolSummary(latest.toolName, latest.input)}` : ""}</span>
+        <span className={`text-xs shrink-0 ${errors > 0 ? "text-danger" : running > 0 ? "text-accent" : "text-muted"}`}>{statusText}</span>
+        {expanded ? <ChevronDown size={14} className="text-muted shrink-0" /> : <ChevronRight size={14} className="text-muted shrink-0" />}
+      </button>
+      {expanded && (
+        <div className="border-t border-border p-2 space-y-2 max-h-64 overflow-y-auto">
+          {tools.map((tool) => <ToolCard key={tool.toolCallId} tool={tool} t={t} />)}
+        </div>
+      )}
     </div>
   );
 }

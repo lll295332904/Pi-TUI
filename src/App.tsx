@@ -6,7 +6,7 @@ import {
   setThinkingLevel, setAutoCompaction, setAutoRetry,
   setSteeringMode, setFollowUpMode, checkPiHealth, loadUserdata,
   getSessionsDir, switchSession, newPiSession, steer, saveUserdata,
-  restartSession, isValidModelRef,
+  restartSession, isValidModelRef, getAppError,
 } from "./bridge";
 import { switchModel } from "./model-switch";
 import type { PiRawAgentEvent, TimelineItem, MessageVM, ToolCallVM, PiOutboundEvent, SessionEntryVm, ExtensionUiRequest, RoleModels, PiDeskSettings, ThinkingLevel } from "./types";
@@ -26,6 +26,7 @@ import ShortcutsPanel from "./components/ShortcutsPanel";
 import StartupDiagnosticsPanel from "./components/StartupCheck";
 import SetupWizard from "./components/SetupWizard";
 import { getT } from "./i18n";
+import { registerRecoveryHandler } from "./recovery-actions";
 
 // Add this at the top of App() body after other hooks
 // (we'll use useT inside the callback, not at module level)
@@ -86,7 +87,9 @@ export default function App() {
   const setCurrentRole = usePiDeskStore((s) => s.setCurrentRole);
 
   // Track streaming assistant message
-  const streamRef = useRef<{ id: string; thinking: string; text: string } | null>(null);
+  // Keep streaming state per session so background sessions cannot update the selected page.
+  const streamRefs = useRef<Record<string, { id: string; thinking: string; text: string }>>({});
+  const streamUpdateTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // Last time any pi agent event arrived (used by the response-timeout guard)
   const lastEventRef = useRef<number>(Date.now());
   // Guard against concurrent resume for the same cwd
@@ -102,6 +105,18 @@ export default function App() {
   const [exitedSessions, setExitedSessions] = useState<Set<string>>(new Set());
   const [restartingSession, setRestartingSession] = useState<string | null>(null);
 
+  function presentAppError(error: unknown, fallbackTitle: string, fallbackMessage?: string) {
+    const appError = getAppError(error);
+    usePiDeskStore.getState().addToast({
+      type: "error",
+      title: fallbackTitle,
+      message: appError?.message ?? fallbackMessage ?? String(error).slice(0, 200),
+      durationMs: 8000,
+      actionLabel: appError?.recoverable ? appError.actionLabel : undefined,
+      actionCommand: appError?.recoverable ? appError.actionCommand : undefined,
+    });
+  }
+
   async function handleRestartSession(sessionId: string) {
     const sess = usePiDeskStore.getState().sessions[sessionId];
     if (!sess) return;
@@ -114,10 +129,41 @@ export default function App() {
       appendTimeline({ type: "system-info", text: "Pi process restarted", timestamp: Date.now() });
     } catch (e) {
       appendTimeline({ type: "system-info", text: `Restart failed: ${String(e)}`, timestamp: Date.now() });
+      presentAppError(e, "Restart Failed");
     } finally {
       setRestartingSession(null);
     }
   }
+
+  useEffect(() => {
+    registerRecoveryHandler(async (command) => {
+      const store = usePiDeskStore.getState();
+      const sid = store.activeSessionId;
+      if (command === "restart_pi" && sid) {
+        await handleRestartSession(sid);
+        return;
+      }
+      if (command === "check_permissions") {
+        store.setSettingsOpen(true);
+        store.addToast({
+          type: "info",
+          title: "Check Permissions",
+          message: "Review your Pi agent directory permissions and writable config files.",
+        });
+        return;
+      }
+      if (command === "check_network") {
+        store.setSettingsOpen(true);
+        store.addToast({
+          type: "info",
+          title: "Check Network",
+          message: "Verify the provider base URL, proxy, and outbound network access.",
+        });
+        return;
+      }
+    });
+    return () => registerRecoveryHandler(null);
+  }, [handleRestartSession]);
 
   // ── Role-based model switching ──
 
@@ -146,7 +192,7 @@ export default function App() {
   // ── Pi event handler ──
   const handlePiEvent = useCallback((ev: PiOutboundEvent) => {
     const store = usePiDeskStore.getState();
-    const sessionId = store.activeSessionId;
+    const sessionId = ev.sessionId;
 
     // Any agent activity (thinking, text, tool calls, retries) resets the
     // response-timeout guard — the request is clearly alive.
@@ -155,7 +201,7 @@ export default function App() {
     }
 
     // Console log: append raw event JSON
-    if (sessionId) {
+    if (sessionId && store.consoleOpen) {
       try { store.appendConsoleLog(sessionId, JSON.stringify(ev)); } catch { /* ignore */ }
     }
 
@@ -170,18 +216,26 @@ export default function App() {
       const output = usage.output ?? usage.outputTokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0;
       if (input > 0 || output > 0) {
         store.accumulateUsage(sessionId, input, output);
+        const modelRef = store.sessions[sessionId]?.model;
+        if (modelRef) {
+          const matched = store.availableModels.find((m) => m.provider === modelRef.provider && m.id === modelRef.id);
+          const contextMax = matched?.contextWindow || 0;
+          if (contextMax > 0) {
+            (usePiDeskStore.getState() as unknown as { setSessionContextUsage?: (id: string, usedTokens: number, maxTokens: number) => void }).setSessionContextUsage?.(sessionId, input + output, contextMax);
+          }
+        }
       }
     }
 
     if (ev.kind === "stderr") {
       const line = (ev.event as { line?: string })?.line ?? "";
-      appendTimeline({ type: "system-info", text: `[pi] ${line}`, timestamp: Date.now() });
+      appendTimeline({ type: "system-info", text: `[pi] ${line}`, timestamp: Date.now() }, sessionId);
       return;
     }
 
     if (ev.kind === "process-exit") {
       const sid = ev.sessionId;
-      appendTimeline({ type: "system-info", text: "Pi process exited. Click restart to recover.", timestamp: Date.now() });
+      appendTimeline({ type: "system-info", text: "Pi process exited. Click restart to recover.", timestamp: Date.now() }, sessionId);
       updateStatus(sid, "exited");
       setExitedSessions(prev => new Set(prev).add(sid));
       return;
@@ -191,7 +245,7 @@ export default function App() {
       const msg = (ev.event as { message?: string })?.message
         ?? (ev.event as { error?: string })?.error
         ?? JSON.stringify(ev.event);
-      appendTimeline({ type: "system-info", text: `Error: ${msg}`, timestamp: Date.now() });
+      appendTimeline({ type: "system-info", text: `Error: ${msg}`, timestamp: Date.now() }, sessionId);
       return;
     }
 
@@ -199,7 +253,7 @@ export default function App() {
       const rpc = ev.event as { command?: string; success?: boolean; error?: string; data?: unknown };
       if (rpc.success === false && rpc.error) {
         const cmd = rpc.command || "unknown";
-        appendTimeline({ type: "system-info", text: `[${cmd}] failed: ${rpc.error}`, timestamp: Date.now() });
+        appendTimeline({ type: "system-info", text: `[${cmd}] failed: ${rpc.error}`, timestamp: Date.now() }, sessionId);
         const s = usePiDeskStore.getState();
         const t = getT(s.language);
         if (cmd === "set_model") {
@@ -263,58 +317,84 @@ export default function App() {
     if (ev.kind !== "agent-event" || !ev.event) return;
 
     const event = ev.event as PiRawAgentEvent;
-    const sid = usePiDeskStore.getState().activeSessionId;
+    const sid = sessionId;
+    const streamRef = streamRefs.current[sessionId];
+    let currentStream = streamRef;
+    const scheduleStreamUpdate = () => {
+      if (streamUpdateTimers.current[sessionId]) return;
+      streamUpdateTimers.current[sessionId] = setTimeout(() => {
+        delete streamUpdateTimers.current[sessionId];
+        const latest = streamRefs.current[sessionId];
+        if (latest) updateTimelineItem(latest.id, { text: latest.text, thinking: latest.thinking }, sessionId);
+      }, 32);
+    };
+    const flushStreamUpdate = () => {
+      const timer = streamUpdateTimers.current[sessionId];
+      if (timer) clearTimeout(timer);
+      delete streamUpdateTimers.current[sessionId];
+      const latest = streamRefs.current[sessionId];
+      if (latest) updateTimelineItem(latest.id, { text: latest.text, thinking: latest.thinking }, sessionId);
+    };
 
     switch (event.type) {
       case "message_update": {
         const ame = event.assistantMessageEvent;
         if (!ame) break;
-        if (!streamRef.current) {
-          streamRef.current = { id: `asst-${Date.now()}`, thinking: "", text: "" };
-          const msg: MessageVM = { id: streamRef.current.id, role: "assistant", text: "", thinking: "", streaming: true, timestamp: Date.now() };
-          appendTimeline({ type: "assistant", ...msg } as TimelineItem);
-          if (sid) { prevStatusRef.current[sid] = "streaming"; updateStatus(sid, "streaming"); }
+        if (!currentStream) {
+          currentStream = { id: `asst-${Date.now()}`, thinking: "", text: "" };
+          streamRefs.current[sessionId] = currentStream;
+          const msg: MessageVM = { id: currentStream.id, role: "assistant", text: "", thinking: "", streaming: true, timestamp: Date.now() };
+          appendTimeline({ type: "assistant", ...msg } as TimelineItem, sessionId);
+          prevStatusRef.current[sessionId] = "streaming";
+          updateStatus(sessionId, "streaming");
         }
         switch (ame.type) {
           case "thinking_delta":
-            streamRef.current.thinking += ame.delta ?? "";
-            updateTimelineItem(streamRef.current.id, { thinking: streamRef.current.thinking });
+            currentStream.thinking += ame.delta ?? "";
+            scheduleStreamUpdate();
             break;
           case "thinking_end":
-            if (ame.content) streamRef.current.thinking = ame.content;
-            updateTimelineItem(streamRef.current.id, { thinking: streamRef.current.thinking });
+            if (ame.content) currentStream.thinking = ame.content;
+            scheduleStreamUpdate();
             break;
           case "text_delta":
-            streamRef.current.text += ame.delta ?? "";
-            updateTimelineItem(streamRef.current.id, { text: streamRef.current.text });
+            currentStream.text += ame.delta ?? "";
+            scheduleStreamUpdate();
             break;
           case "text_end":
-            if (ame.content) streamRef.current.text = ame.content;
-            updateTimelineItem(streamRef.current.id, { text: streamRef.current.text });
+            if (ame.content) currentStream.text = ame.content;
+            scheduleStreamUpdate();
             break;
         }
         break;
       }
       case "message_end":
       case "turn_end": {
-        if (streamRef.current) {
+        if (currentStream) {
           if (event.message?.content) {
             for (const block of event.message.content) {
-              if (block.type === "thinking" && typeof block.thinking === "string") streamRef.current.thinking = block.thinking;
-              if (block.type === "text" && typeof block.text === "string") streamRef.current.text = block.text;
+              if (block.type === "thinking" && typeof block.thinking === "string") currentStream.thinking = block.thinking;
+              if (block.type === "text" && typeof block.text === "string") currentStream.text = block.text;
             }
           }
-          updateTimelineItem(streamRef.current.id, { text: streamRef.current.text, thinking: streamRef.current.thinking, streaming: false });
-          streamRef.current = null;
+          flushStreamUpdate();
+          updateTimelineItem(currentStream.id, { text: currentStream.text, thinking: currentStream.thinking, streaming: false }, sessionId);
+          delete streamRefs.current[sessionId];
         }
         break;
       }
       case "agent_end": {
-        if (streamRef.current) { updateTimelineItem(streamRef.current.id, { streaming: false }); streamRef.current = null; }
+        if (currentStream) {
+          updateTimelineItem(currentStream.id, { streaming: false }, sessionId);
+          delete streamRefs.current[sessionId];
+        }
         break;
       }
       case "agent_settled": {
-        if (streamRef.current) { updateTimelineItem(streamRef.current.id, { streaming: false }); streamRef.current = null; }
+        if (currentStream) {
+          updateTimelineItem(currentStream.id, { streaming: false }, sessionId);
+          delete streamRefs.current[sessionId];
+        }
         if (sid) {
           const prev = prevStatusRef.current[sid] || "";
           if (prev === "streaming" || prev === "compacting") {
@@ -325,16 +405,17 @@ export default function App() {
           prevStatusRef.current[sid] = "idle";
           updateStatus(sid, "idle");
         }
-        // Restore main model after task completes
-        restoreMainModel();
+        // Restore the model only when the completed task is still selected.
+        if (sessionId === usePiDeskStore.getState().activeSessionId) restoreMainModel();
         break;
       }
       case "tool_execution_start": {
         const toolName = event.toolName ?? "unknown";
         const tool: ToolCallVM = { toolCallId: event.toolCallId ?? `tool-${Date.now()}`, toolName, input: event.input, isError: false, state: "running", timestamp: Date.now() };
-        appendTimeline({ type: "tool", ...tool } as TimelineItem);
+        appendTimeline({ type: "tool", ...tool } as TimelineItem, sessionId);
         const normalizedTool = toolName.toLowerCase();
         // Custom MCP tools are conventionally exposed as mcp__server__tool.
+        if (sessionId !== usePiDeskStore.getState().activeSessionId) break;
         if (normalizedTool.startsWith("mcp__") || normalizedTool.startsWith("mcp_") || normalizedTool.includes("mcp.")) {
           switchToRole("mcp");
         } else if (/sub.?agent|delegate|spawn.?agent|child.?agent|task_agent/.test(normalizedTool)) {
@@ -350,16 +431,16 @@ export default function App() {
         const tcid = event.toolCallId ?? "";
         if (event.isDelta) {
           const store = usePiDeskStore.getState();
-          const tid = store.activeSessionId ? (store.sessionTimelines[store.activeSessionId] || []) : [];
+          const tid = store.sessionTimelines[sessionId] || [];
           const existing = tid.find((t) => t.type === "tool" && t.toolCallId === tcid) as ToolCallVM | undefined;
-          updateTimelineItem(tcid, { output: (existing?.output ?? "") + (event.output ?? "") });
+          updateTimelineItem(tcid, { output: (existing?.output ?? "") + (event.output ?? "") }, sessionId);
         } else {
-          updateTimelineItem(tcid, { output: event.output });
+          updateTimelineItem(tcid, { output: event.output }, sessionId);
         }
         break;
       }
       case "tool_execution_end":
-        updateTimelineItem(event.toolCallId ?? "", { state: "done" as const, result: event.result, isError: event.isError ?? false });
+        updateTimelineItem(event.toolCallId ?? "", { state: "done" as const, result: event.result, isError: event.isError ?? false }, sessionId);
         break;
       // Pi 0.82 emits compaction_start/compaction_end. Keep the older names
       // as aliases for compatibility with older bundled Pi builds.
@@ -403,7 +484,7 @@ export default function App() {
         break;
       }
       case "system_info":
-        if (event.text) appendTimeline({ type: "system-info", text: event.text, timestamp: Date.now() });
+        if (event.text) appendTimeline({ type: "system-info", text: event.text, timestamp: Date.now() }, sessionId);
         break;
     }
   }, [appendTimeline, updateTimelineItem, updateStatus, addExtensionUiRequest, updateSessionModel, updateSessionThinkingLevel, restoreMainModel, switchToRole]);
@@ -607,12 +688,7 @@ export default function App() {
       usePiDeskStore.getState().setLastActiveCwd(cwd);
     } catch (e) {
       console.error("Failed to start session:", e);
-      usePiDeskStore.getState().addToast({
-        type: "error",
-        title: "Session Error",
-        message: String(e).slice(0, 200),
-        durationMs: 8000,
-      });
+      presentAppError(e, "Session Error");
     }
   }, [setActiveSession, applySettingsToSession, addProject, newPiSession]);
 
@@ -670,12 +746,7 @@ export default function App() {
       await applySettingsToSession(id);
     } catch (e) {
       console.error("Failed to resume session:", e);
-      usePiDeskStore.getState().addToast({
-        type: "error",
-        title: "Resume Failed",
-        message: String(e).slice(0, 200),
-        durationMs: 8000,
-      });
+      presentAppError(e, "Resume Failed");
     } finally {
       resumingRef.current.delete(cwd);
     }
@@ -734,6 +805,7 @@ export default function App() {
     } catch (e) {
       updateStatus(activeId, "idle");
       appendTimeline({ type: "system-info", text: `Error: ${String(e)}`, timestamp: Date.now() });
+      presentAppError(e, "Request Failed");
     }
   }, [activeId, appendTimeline, updateStatus, renameSession, clearInput]);
 

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { usePiDeskStore } from "../store/pidesk";
+import { runRecoveryAction } from "../recovery-actions";
 import type { ToastItem } from "../types";
 import { CheckCircle, AlertTriangle, Info, AlertCircle, X } from "lucide-react";
 
@@ -20,19 +21,44 @@ const COLOR_MAP = {
 export default function ToastContainer() {
   const toasts = usePiDeskStore((s) => s.toasts);
   const removeToast = usePiDeskStore((s) => s.removeToast);
+  const setSettingsOpen = usePiDeskStore((s) => s.setSettingsOpen);
+  const setActiveSession = usePiDeskStore((s) => s.setActiveSession);
 
   if (toasts.length === 0) return null;
 
   return (
     <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2 max-w-sm">
       {toasts.map((toast) => (
-        <ToastItem key={toast.id} toast={toast} onDismiss={() => removeToast(toast.id)} />
+        <ToastItem
+          key={toast.id}
+          toast={toast}
+          onDismiss={() => removeToast(toast.id)}
+          onAction={async () => {
+            switch (toast.actionCommand) {
+              case "open_settings":
+                setSettingsOpen(true);
+                break;
+              case "go_home": {
+                const sessions = usePiDeskStore.getState().sessions;
+                const first = Object.values(sessions)[0];
+                if (first) setActiveSession(first.id, first);
+                break;
+              }
+              default:
+                if (toast.actionCommand) {
+                  await runRecoveryAction(toast.actionCommand);
+                }
+                break;
+            }
+            removeToast(toast.id);
+          }}
+        />
       ))}
     </div>
   );
 }
 
-function ToastItem({ toast, onDismiss }: { toast: ToastItem; onDismiss: () => void }) {
+function ToastItem({ toast, onDismiss, onAction }: { toast: ToastItem; onDismiss: () => void; onAction: () => void }) {
   const Icon = ICON_MAP[toast.type];
   const color = COLOR_MAP[toast.type];
 
@@ -48,6 +74,14 @@ function ToastItem({ toast, onDismiss }: { toast: ToastItem; onDismiss: () => vo
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">{toast.title}</div>
         {toast.message && <div className="text-xs opacity-80 mt-0.5">{toast.message}</div>}
+        {toast.actionLabel && toast.actionCommand && (
+          <button
+            onClick={onAction}
+            className="mt-2 text-xs font-medium underline underline-offset-2 opacity-90 hover:opacity-100"
+          >
+            {toast.actionLabel}
+          </button>
+        )}
       </div>
       <button onClick={onDismiss} className="shrink-0 opacity-60 hover:opacity-100">
         <X size={14} />

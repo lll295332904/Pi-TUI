@@ -1,3 +1,4 @@
+use crate::logger::{sanitize_key, Logger};
 use crate::pi_locator::{find_pi_runtime, PiRuntime};
 use serde::Serialize;
 use serde_json::Value;
@@ -167,6 +168,8 @@ impl PiKernelManager {
         provider: Option<String>,
         model: Option<String>,
     ) -> PiResult<String> {
+        let logger = Logger::new();
+        logger.info(&format!("starting pi session cwd={}", cwd));
         let runtime = find_pi_runtime().map_err(|e| PiError::CliNotFound(e))?;
         let session_id = Uuid::new_v4().to_string();
 
@@ -218,6 +221,12 @@ impl PiKernelManager {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            logger.error(&format!(
+                "pi startup failed session={} status={} details={}",
+                session_id,
+                status,
+                details
+            ));
             return Err(PiError::Session(format!(
                 "Pi RPC process exited during startup with status {}{}",
                 status,
@@ -310,9 +319,15 @@ impl PiKernelManager {
 
         // Spawn task to read stderr and forward to frontend for diagnostics
         tokio::spawn(async move {
+            let logger = Logger::new();
+            let log_dir = logger.log_dir();
+            let _ = std::fs::create_dir_all(&log_dir);
+            let stderr_log = log_dir.join("pi-stderr.log");
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&stderr_log)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, format!("[{}] {}\n", sid2, line).as_bytes()));
                 let ev = PiOutboundEvent {
                     session_id: sid2.clone(),
                     kind: "stderr".into(),
@@ -329,6 +344,7 @@ impl PiKernelManager {
         };
 
         self.sessions.insert(session_id.clone(), session);
+        logger.info(&format!("started pi session id={} cwd={}", sanitize_key(&session_id), cwd));
         Ok(session_id)
     }
 
@@ -347,9 +363,9 @@ impl PiKernelManager {
     /// Stop a session (kill the child process)
     pub async fn stop_session(&mut self, session_id: &str) -> PiResult<()> {
         if let Some(mut session) = self.sessions.remove(session_id) {
-            // Drop stdin first so Pi sees EOF and may flush
+            let logger = Logger::new();
+            logger.info(&format!("stopping pi session id={}", sanitize_key(session_id)));
             drop(session.stdin);
-            // Give Pi a moment to flush JSONL writes to disk
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let _ = session.child.kill().await;
         }
@@ -384,7 +400,8 @@ impl PiKernelManager {
         session_id: &str,
         cwd: &str,
     ) -> PiResult<()> {
-        // Stop existing process
+        let logger = Logger::new();
+        logger.info(&format!("restarting pi session id={} cwd={}", sanitize_key(session_id), cwd));
         if let Some(mut session) = self.sessions.remove(session_id) {
             drop(session.stdin);
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;

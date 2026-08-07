@@ -104,6 +104,7 @@ impl AppError {
 
 /// Frontend-friendly error DTO
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppErrorDto {
     pub code: String,
     pub message: String,
@@ -128,5 +129,13 @@ impl From<std::io::Error> for AppError {
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         AppError::ConfigReadFailed { detail: e.to_string() }
+    }
+}
+
+pub type AppResult<T> = Result<T, AppErrorDto>;
+
+impl From<AppError> for AppErrorDto {
+    fn from(value: AppError) -> Self {
+        value.to_dto()
     }
 }

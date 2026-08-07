@@ -1,12 +1,13 @@
 import { useRef, useCallback, useState, KeyboardEvent } from "react";
 import { usePiDeskStore } from "../store/pidesk";
-import { Send, Square, Mic, MicOff } from "lucide-react";
+import { Send, Square, Mic, MicOff, Paperclip, X } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 
 const SpeechRecognitionAPI = (window as unknown as Record<string, unknown>).SpeechRecognition ||
   (window as unknown as Record<string, unknown>).webkitSpeechRecognition;
 
 interface Props {
-  onSend: (text: string) => void;
+  onSend: (text: string, images?: string[]) => void;
   onAbort: () => void;
 }
 
@@ -14,6 +15,9 @@ export default function Composer({ onSend, onAbort }: Props) {
   const inputValue = usePiDeskStore((s) => s.inputValue);
   const setInputValue = usePiDeskStore((s) => s.setInputValue);
   const activeId = usePiDeskStore((s) => s.activeSessionId);
+  const inputImages = usePiDeskStore((s) => s.inputImages);
+  const addInputImage = usePiDeskStore((s) => s.addInputImage);
+  const removeInputImage = usePiDeskStore((s) => s.removeInputImage);
   const sessions = usePiDeskStore((s) => s.sessions);
   const isStreaming = activeId ? sessions[activeId]?.status === "streaming" : false;
 
@@ -23,9 +27,22 @@ export default function Composer({ onSend, onAbort }: Props) {
 
   const handleSend = useCallback(() => {
     const trimmed = inputValue.trim();
-    if (!trimmed || !activeId) return;
-    onSend(trimmed);
-  }, [inputValue, activeId, onSend]);
+    if ((!trimmed && inputImages.length === 0) || !activeId) return;
+    onSend(trimmed, inputImages);
+  }, [inputValue, inputImages, activeId, onSend]);
+
+  const handleAttachImages = useCallback(async () => {
+    const selected = await open({
+      multiple: true,
+      directory: false,
+      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] }],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    for (const path of paths) {
+      if (!inputImages.includes(path)) addInputImage(path);
+    }
+  }, [inputImages, addInputImage]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -84,6 +101,18 @@ export default function Composer({ onSend, onAbort }: Props) {
 
   return (
     <div className="border-t border-border bg-surface px-3 py-2 shrink-0">
+      {inputImages.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 max-w-4xl mx-auto mb-2">
+          {inputImages.map((path) => (
+            <div key={path} className="flex items-center gap-1 max-w-56 px-2 py-1 rounded border border-border bg-gray-50 text-xs text-gray-600">
+              <span className="truncate" title={path}>{path.split(/[\\/]/).pop()}</span>
+              <button onClick={() => removeInputImage(path)} className="shrink-0 text-gray-400 hover:text-danger" title="Remove image" aria-label="Remove image">
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="flex items-end gap-2 max-w-4xl mx-auto">
         {/* Voice button */}
         {!!SpeechRecognitionAPI && (
@@ -112,8 +141,17 @@ export default function Composer({ onSend, onAbort }: Props) {
           disabled={!activeId}
         />
         <button
+          onClick={handleAttachImages}
+          disabled={!activeId || isStreaming}
+          className="shrink-0 p-2 rounded-md text-gray-400 hover:text-accent disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Attach image"
+          aria-label="Attach image"
+        >
+          <Paperclip size={16} />
+        </button>
+        <button
           onClick={isStreaming ? onAbort : handleSend}
-          disabled={!activeId || (!isStreaming && !inputValue.trim())}
+          disabled={!activeId || (!isStreaming && !inputValue.trim() && inputImages.length === 0)}
           className={`shrink-0 p-2 rounded-md transition-colors ${
             isStreaming
               ? "bg-danger text-white hover:bg-danger-hover"
