@@ -61,6 +61,10 @@ pub struct SessionEntryVm {
     pub content: Option<String>,
     pub thinking: Option<String>,
     pub timestamp: Option<String>,
+    pub model_provider: Option<String>,
+    pub model_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,6 +273,8 @@ pub fn load_session_entries(session_id: String) -> AppResult<Vec<SessionEntryVm>
         .map_err(|e| AppError::ConfigReadFailed { detail: e.to_string() })?;
 
     let mut entries: Vec<SessionEntryVm> = Vec::new();
+    let mut current_model_provider: Option<String> = None;
+    let mut current_model_id: Option<String> = None;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -297,6 +303,11 @@ pub fn load_session_entries(session_id: String) -> AppResult<Vec<SessionEntryVm>
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        if entry_type == "model_change" {
+            current_model_provider = val.get("provider").and_then(|v| v.as_str()).map(String::from);
+            current_model_id = val.get("modelId").or_else(|| val.get("model_id")).and_then(|v| v.as_str()).map(String::from);
+            continue;
+        }
         if entry_type != "message" {
             continue;
         }
@@ -339,6 +350,22 @@ pub fn load_session_entries(session_id: String) -> AppResult<Vec<SessionEntryVm>
             }
         }
 
+        let usage = msg.get("usage").or_else(|| val.get("usage"));
+        let input_tokens = usage.and_then(|u| {
+            u.get("input")
+                .or_else(|| u.get("inputTokens"))
+                .or_else(|| u.get("input_tokens"))
+                .or_else(|| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+        });
+        let output_tokens = usage.and_then(|u| {
+            u.get("output")
+                .or_else(|| u.get("outputTokens"))
+                .or_else(|| u.get("output_tokens"))
+                .or_else(|| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+        });
+
         entries.push(SessionEntryVm {
             id,
             entry_type,
@@ -351,6 +378,10 @@ pub fn load_session_entries(session_id: String) -> AppResult<Vec<SessionEntryVm>
                 Some(thinking)
             },
             timestamp,
+            model_provider: current_model_provider.clone(),
+            model_id: current_model_id.clone(),
+            input_tokens,
+            output_tokens,
         });
     }
 

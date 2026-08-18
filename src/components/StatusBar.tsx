@@ -8,12 +8,12 @@ export default function StatusBar() {
   const sessionTimelines = usePiDeskStore((s) => s.sessionTimelines);
   const settings = usePiDeskStore((s) => s.settings);
   const sessionRoles = usePiDeskStore((s) => s.sessionRoles);
-  const globalRole = usePiDeskStore((s) => s.globalRole);
+  const pendingQueues = usePiDeskStore((s) => s.pendingQueues);
   const { t } = useT("statusbar");
 
   const session = activeId ? sessions[activeId] : null;
   const timeline = activeId ? (sessionTimelines[activeId] || []) : [];
-  const currentRole = sessionRoles[activeId || ""] || globalRole;
+  const currentRole = sessionRoles[activeId || ""] || "main";
 
   if (!session) {
     return (
@@ -30,6 +30,7 @@ export default function StatusBar() {
       <span>{t("status")}: {t(session.status)}</span>
       <span>{t("messages")}: {msgCount}</span>
       <span>{t("role")}: {(ROLE_LABELS as Record<string, string>)[currentRole] || currentRole}</span>
+      {(() => { const n = (pendingQueues[activeId ?? ""] || []).length; return n > 0 ? <span className="text-amber-500 font-medium">{t("queued")}: {n}</span> : null; })()}
       {session.model && (
         <span className="hidden sm:inline">
           {t("model")}: {session.model.provider}/{session.model.id}

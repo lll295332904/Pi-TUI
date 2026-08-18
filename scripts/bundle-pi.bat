@@ -6,14 +6,39 @@ echo ================================
 echo   Bundle Pi for Tauri Sidecar
 echo ================================
 
-set "PI_SRC=%APPDATA%\npm\node_modules\@earendil-works\pi-coding-agent"
-if not exist "%PI_SRC%\dist" (
-    echo ERROR: Pi not found at %PI_SRC%
-    echo Run: npm install -g @earendil-works/pi-coding-agent
+set "BUNDLE_DIR=src-tauri\pi-bundle"
+
+rem ------------------------------------------------------------------
+rem  This project ships a self-contained pi bundle under src-tauri\pi-bundle,
+rem  so no external pi install is required to build.
+rem
+rem  - Default: use the bundled copy already present in the project.
+rem    If it exists and passes verification, re-bundling is skipped.
+rem  - Optional: set PI_SRC_OVERRIDE=<path> to re-bundle from another pi
+rem    install (e.g. a fresh npm global install), e.g.:
+rem      set PI_SRC_OVERRIDE=%APPDATA%\npm\node_modules\@earendil-works\pi-coding-agent
+rem ------------------------------------------------------------------
+
+if not defined PI_SRC_OVERRIDE (
+    if exist "%BUNDLE_DIR%\node.exe" if exist "%BUNDLE_DIR%\dist\rpc-entry.js" if exist "%BUNDLE_DIR%\dist\index.js" if exist "%BUNDLE_DIR%\node_modules\openai\package.json" if exist "%BUNDLE_DIR%\package.json" (
+        echo Pi bundle already present in %BUNDLE_DIR% - skipping re-bundle.
+        echo (Set PI_SRC_OVERRIDE to force re-bundling from another pi install.)
+        exit /b 0
+    )
+    echo ERROR: %BUNDLE_DIR% is missing or incomplete, and no PI_SRC_OVERRIDE is set.
+    echo Restore the bundle (git checkout src-tauri/pi-bundle) or re-run with:
+    echo   set PI_SRC_OVERRIDE=%%APPDATA%%\npm\node_modules\@earendil-works\pi-coding-agent
     exit /b 1
 )
 
-set "BUNDLE_DIR=src-tauri\pi-bundle"
+set "PI_SRC=%PI_SRC_OVERRIDE%"
+if not exist "%PI_SRC%\dist\rpc-entry.js" (
+    echo ERROR: Pi not found at %PI_SRC%
+    echo Check PI_SRC_OVERRIDE and try again.
+    exit /b 1
+)
+
+echo Re-bundling pi from %PI_SRC% ...
 
 rem ------------------------------------------------------------------
 rem  Remove previous bundle, with retry.
@@ -84,7 +109,10 @@ echo Copying Pi dependencies... OK
 
 echo Copying node.exe...
 set "NODE_COPIED="
-if exist "%APPDATA%\npm\node.exe" (
+if exist "%PI_SRC%\node.exe" (
+    copy /y "%PI_SRC%\node.exe" "%BUNDLE_DIR%\node.exe" >nul
+    set NODE_COPIED=1
+) else if exist "%APPDATA%\npm\node.exe" (
     copy /y "%APPDATA%\npm\node.exe" "%BUNDLE_DIR%\node.exe" >nul
     set NODE_COPIED=1
 ) else if exist "C:\Program Files\nodejs\node.exe" (

@@ -21,6 +21,10 @@ export const sidebar = {
     pinSessionHint: "Pin a session to see it here",
     workspaceName: "工作区名称:",
     noSessionsInWorkspace: "暂无会话",
+    archive: "归档",
+    archiveEmpty: "暂无归档会话",
+    archiveSession: "归档会话",
+    unarchiveSession: "恢复会话",
   },
   en: {
     topTasks: "TOP TASKS",
@@ -44,5 +48,9 @@ export const sidebar = {
     pinSessionHint: "Pin a session to see it here",
     workspaceName: "Workspace name:",
     noSessionsInWorkspace: "No sessions",
+    archive: "Archive",
+    archiveEmpty: "No archived sessions",
+    archiveSession: "Archive session",
+    unarchiveSession: "Restore session",
   },
 };

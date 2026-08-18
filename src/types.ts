@@ -164,6 +164,10 @@ export interface SessionEntryVm {
   content: string | null;   // text content
   thinking: string | null;  // thinking content
   timestamp: string | null;
+  model_provider?: string | null;
+  model_id?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 // ── Frontend ViewModel ──
@@ -201,6 +205,15 @@ export interface ToolCallVM {
   isError: boolean;
   state: "running" | "done";
   timestamp: number;
+}
+
+export interface RequestPerformance {
+  requestId: string;
+  sendAt: number;
+  firstEventAt?: number;
+  firstToolAt?: number;
+  settledAt?: number;
+  firstVisibleRenderAt?: number;
 }
 
 export type TimelineItem =
@@ -252,12 +265,30 @@ export interface PiDeskSettings {
   autoRetry: boolean;
   steeringMode: "all" | "one-at-a-time";
   followUpMode: "all" | "one-at-a-time";
+  /** When the agent is running (streaming/compacting/retrying), messages the
+   *  user sends are queued and auto-sent after the current task settles
+   *  instead of being injected mid-turn via steer. */
+  queueWhileRunning: boolean;
   roleModels: RoleModels;
+  roleThinkingLevels: RoleThinkingLevels;
+}
+
+/** A user message waiting in the per-session pending queue. */
+export interface PendingQueueItem {
+  id: string;
+  text: string;
+  images?: string[];
+  timestamp: number;
 }
 
 // ── Role-specific models (Hermes-style) ──
 
 export type ModelRef = { provider: string; id: string };
+
+/** Per-role thinking level preference (P2 optimization). `Partial` so users can
+ *  leave roles unconfigured; the level is only applied if the role's model
+ *  actually supports it (e.g. deepseek-v4 only supports high/max). */
+export type RoleThinkingLevels = Partial<Record<keyof RoleModels, ThinkingLevel>>;
 
 export interface RoleModels {
   main: ModelRef | null;

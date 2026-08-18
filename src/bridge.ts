@@ -336,6 +336,13 @@ export async function checkPiHealth(sessionId: string): Promise<boolean> {
   return invokeSafe<boolean>("check_pi_health", { sessionId });
 }
 
+// ── Image display ──
+
+/** Return a `data:` URL for a local image so the conversation can render attachments. */
+export async function imageToDataUrl(path: string): Promise<string> {
+  return invokeSafe<string>("image_to_data_url", { path });
+}
+
 export async function restartSession(sessionId: string, cwd: string): Promise<void> {
   return invokeSafe("restart_session", { sessionId, cwd });
 }
@@ -370,6 +377,18 @@ export async function exportDiagnostics(): Promise<string> {
 
 export function onPiEvent(handler: (event: PiOutboundEvent) => void): () => void {
   const unlisten = listen<PiOutboundEvent>("pi:event", (e) => handler(e.payload));
+  return () => {
+    unlisten.then((fn) => fn());
+  };
+}
+
+/**
+ * Subscribe to backend model-catalog changes (add_model / remove_model emit
+ * "models:changed"). The frontend refreshes its cached list from the single
+ * source of truth (the merged catalog) instead of mutating it locally.
+ */
+export function onModelsChanged(handler: () => void): () => void {
+  const unlisten = listen("models:changed", () => handler());
   return () => {
     unlisten.then((fn) => fn());
   };

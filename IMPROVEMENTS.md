@@ -84,6 +84,22 @@
 | `scripts/bundle-pi.bat` | S1: 修复 node.exe 查找路径为 `%APPDATA%\npm\node.exe` |
 | `start-pidesk.bat` | S3: 移除重复的 `SAFE_DELETE_DISABLE=1` |
 
+### 模型配置优化批次 (2026-08-10,优化 9-18) — 详见 `docs/model-config-optimization-2026-08-10.md` §5/§6
+
+| 文件 | 变更内容 |
+|---|---|
+| `~/.pi/agent/models.json` | gpt-5.4/5.5/5.6-sol/5.6-terra 开启 `reasoning: true` + thinkingLevelMap(high/max);gpt-5.x 加 samplingParams `{temperature:0.3, top_p:0.9}`;mimo-v2.5/pro 加 samplingParams `{temperature:0.7}`、maxTokens `16384→32768`(落盘修正见下) |
+| `~/.pi/agent/models.json` | deepseek-v4-flash/pro 思考档位修正(依据官方文档):thinkingLevelMap 开放 `off/low/high/max` + `compat.supportsReasoningEffort: true`(此前 reasoning_effort 从不发送,high/max 无强度语义);mimo maxTokens 32768 因 heredoc 中文键编码破坏未落盘,已用 id 匹配重写并字节级确认 |
+| `~/.pi/agent/settings.json` | retry 显式化 `timeoutMs:600000`(maxRetries 保持 0);thinkingBudgets 补 `max:65536`;`showCacheMissNotices:true`;defaultModel `flash→pro`;`httpIdleTimeoutMs:600000`;branchSummary.reserveTokens 显式化 |
+| `src/store/pidesk.ts` | `DEFAULT_SETTINGS.defaultThinkingLevel` `medium→high`(与 Pi 全局一致);merge 迁移残留 medium→high;`DEFAULT_ROLE_THINKING_LEVELS` skills/mcp `medium→low` + 迁移归一(deepseek 无 medium 档) |
+| `src/App.tsx` | 继承逻辑重构:thinking level 独立于 defaultModel 继承——用户选过模型但其 level 在 Pi 全局模型上不可用时仍继承 Pi 的 level |
+
+**回归**:`tsc --noEmit` / `vite build` / `cargo check` 全部通过;三份 JSON(`settings/models/models-store`)校验通过;merge_catalog 合并视图 9 模型与内核一致;roleModels 引用全部可解析。
+
+**备份**:`models.json.bak-pidesk-thinking` / `settings.json.bak-pidesk-timeout-max` / `settings.json.bak-pidesk-round2` / `models.json.bak-pidesk-round2`
+
+**待实测**:gpt-5.x 开 thinking 后需验证 Nexus 聚合层实际透传思考;mimo 32K 输出需验证小米 API 支持(均留有按 id 覆盖的秒级回退路径)
+
 ### 暂缓项（需较大工程量）
 
 - **F1 暗色主题** — 需要设计 tokens + 重构 Tailwind 颜色方案

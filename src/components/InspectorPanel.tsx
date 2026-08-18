@@ -1,7 +1,6 @@
 import { useMemo } from "react";
-import { X, Clock, FolderOpen, Activity, Wrench, Cpu, Sparkles, SquareSlash } from "lucide-react";
+import { X, Clock, FolderOpen, Activity, Wrench, Cpu, Sparkles, Bug } from "lucide-react";
 import { usePiDeskStore } from "../store/pidesk";
-import { compactSession } from "../bridge";
 import type { TimelineItem } from "../types";
 import { useT } from "../i18n";
 
@@ -22,6 +21,16 @@ const ROLE_LABELS_I18N: Record<string, string> = {
   subAgent: "lblSubAgent",
 };
 
+function formatDuration(ms: number | null): string {
+  if (ms == null) return "-";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
+function PerfRow({ label, value }: { label: string; value: string }) {
+  return <div className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-gray-700 font-medium">{value}</span></div>;
+}
+
 export default function InspectorPanel() {
   // ALL hooks must come before any early return (Rules of Hooks)
   const { t } = useT("inspector");
@@ -32,16 +41,48 @@ export default function InspectorPanel() {
   const timelines = usePiDeskStore((s) => s.sessionTimelines);
   const sessionUsage = usePiDeskStore((s) => s.sessionUsage);
   const sessionContextUsage = usePiDeskStore((s) => s.sessionContextUsage);
-  const currentRole = usePiDeskStore((s) => (s.activeSessionId && s.sessionRoles[s.activeSessionId]) || s.globalRole);
+  const availableModels = usePiDeskStore((s) => s.availableModels);
+  const sessionRequestPerformance = usePiDeskStore((s) => s.sessionRequestPerformance);
+  const lastCompletedRequestPerformance = usePiDeskStore((s) => s.lastCompletedRequestPerformance);
+  const currentRole = usePiDeskStore((s) => s.sessionRoles[s.activeSessionId || ""]);
+  const defaultModel = usePiDeskStore((s) => s.settings.defaultModel);
 
   const session = activeId ? sessions[activeId] : null;
   const timeline = activeId ? (timelines[activeId] || []) : [];
-  const usage = activeId ? (sessionUsage[activeId] || { inputTokens: 0, outputTokens: 0 }) : { inputTokens: 0, outputTokens: 0 };
-  const contextUsage = activeId ? (sessionContextUsage[activeId] || { usedTokens: 0, maxTokens: 0 }) : { usedTokens: 0, maxTokens: 0 };
+  const usageKey = session?.fileId || activeId || "";
+  const hasFileUsage = Boolean(session?.fileId && sessionUsage[session.fileId]);
+  const hasRuntimeUsage = Boolean(activeId && sessionUsage[activeId]);
+  const usageSource = hasFileUsage ? "fileId" : hasRuntimeUsage ? "sessionId" : "none";
+  const usage = usageKey ? (sessionUsage[usageKey] || sessionUsage[activeId || ""] || { inputTokens: 0, outputTokens: 0 }) : { inputTokens: 0, outputTokens: 0 };
+  const persistedContextUsage = usageKey ? (sessionContextUsage[usageKey] || sessionContextUsage[activeId || ""] || { usedTokens: 0, maxTokens: 0 }) : { usedTokens: 0, maxTokens: 0 };
+  const effectiveModelRef = session?.model || defaultModel || undefined;
+  const matchedModel = effectiveModelRef ? availableModels.find((m) => m.provider === effectiveModelRef.provider && m.id === effectiveModelRef.id) : undefined;
+  const resolvedContextMax = matchedModel?.contextWindow || 0;
+  const fallbackContextUsage = {
+    usedTokens: usage.inputTokens + usage.outputTokens,
+    maxTokens: resolvedContextMax,
+  };
+  const hasCurrentModelLimit = resolvedContextMax > 0;
+  const contextLimitSource = hasCurrentModelLimit
+    ? (session?.model ? "session-model" : "default-model")
+    : persistedContextUsage.maxTokens > 0
+      ? "persisted"
+      : "none";
+  const contextUsage = {
+    // Prefer the persisted estimate (updated by usage accumulation and reset by
+    // compaction_end). The lifetime token total is only a fallback for sessions
+    // that have never produced a context estimate.
+    usedTokens: persistedContextUsage.usedTokens > 0
+      ? persistedContextUsage.usedTokens
+      : fallbackContextUsage.usedTokens,
+    maxTokens: hasCurrentModelLimit ? resolvedContextMax : persistedContextUsage.maxTokens,
+  };
+  const currentPerf = activeId ? sessionRequestPerformance[activeId] : undefined;
+  const lastPerf = activeId ? lastCompletedRequestPerformance[activeId] : undefined;
 
   // I/O 比例（输入 / 输出）。outputTokens 为 0 时无法计算，显示占位符避免除零。
   const ioRatio = usage.outputTokens > 0 ? usage.inputTokens / usage.outputTokens : null;
-  const contextPercent = contextUsage.maxTokens > 0 ? Math.min(100, (contextUsage.usedTokens / contextUsage.maxTokens) * 100) : 0;
+  const contextPercent = contextUsage.maxTokens > 0 ? Math.min(100, (contextUsage.usedTokens / contextUsage.maxTokens) * 100) : null;
   const ratioExceeded = ioRatio !== null && ioRatio > IO_RATIO_UPPER_LIMIT;
 
   const toolCalls = useMemo(() => {
@@ -136,19 +177,9 @@ export default function InspectorPanel() {
               <span className="text-gray-700 font-medium">{contextUsage.usedTokens.toLocaleString()} / {contextUsage.maxTokens.toLocaleString()}</span>
             </div>
             <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-              <div className={`h-full ${contextPercent >= 90 ? "bg-red-500" : contextPercent >= 70 ? "bg-yellow-500" : "bg-accent"}`} style={{ width: `${contextPercent}%` }} />
+              <div className={`h-full ${contextPercent !== null && contextPercent >= 90 ? "bg-red-500" : contextPercent !== null && contextPercent >= 70 ? "bg-yellow-500" : "bg-accent"}`} style={{ width: `${contextPercent ?? 0}%` }} />
             </div>
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] text-muted">{t("contextPercent", { percent: contextUsage.maxTokens > 0 ? String(Math.round(contextPercent)) : "0" })}</span>
-              <button
-                onClick={() => { if (activeId) compactSession(activeId).catch(console.error); }}
-                className="inline-flex items-center gap-1 text-[10px] font-medium text-accent hover:text-accent/80"
-                title={t("compactContext")}
-              >
-                <SquareSlash size={10} />
-                {t("compactContext")}
-              </button>
-            </div>
+            <div className="text-[10px] text-muted">{contextPercent === null ? "—" : t("contextPercent", { percent: String(Math.round(contextPercent)) })}</div>
           </div>
         </section>
 
@@ -176,6 +207,35 @@ export default function InspectorPanel() {
             <div className="flex justify-between"><span className="text-muted">{t("totalItems")}</span><span className="text-gray-700 font-medium">{timeline.length}</span></div>
           </div>
         </section>
+
+        <section>
+          <div className="text-[10px] text-muted font-medium mb-1 uppercase flex items-center gap-1"><Bug size={10} /> {t("debug")}</div>
+          <details className="bg-gray-50 rounded p-1.5">
+            <summary className="cursor-pointer text-[10px] text-muted select-none">{t("debugSummary")}</summary>
+            <div className="mt-1.5 space-y-1 text-[10px]">
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("usageSource")}</span><span className="text-gray-700 font-mono break-all text-right">{usageSource}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("usageKey")}</span><span className="text-gray-700 font-mono break-all text-right">{usageKey || "—"}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("fileId")}</span><span className="text-gray-700 font-mono break-all text-right">{session?.fileId || "—"}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("runtimeSessionId")}</span><span className="text-gray-700 font-mono break-all text-right">{activeId}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("matchedModel")}</span><span className="text-gray-700 font-mono break-all text-right">{matchedModel ? `${matchedModel.provider}/${matchedModel.id}` : "—"}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("modelContextWindow")}</span><span className="text-gray-700 font-mono break-all text-right">{matchedModel?.contextWindow?.toLocaleString() ?? "—"}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("contextLimitSource")}</span><span className="text-gray-700 font-mono break-all text-right">{contextLimitSource}</span></div>
+              <div className="flex justify-between gap-2"><span className="text-muted">{t("persistedContextMax")}</span><span className="text-gray-700 font-mono break-all text-right">{persistedContextUsage.maxTokens.toLocaleString()}</span></div>
+            </div>
+          </details>
+        </section>
+
+        {(currentPerf || lastPerf) && (
+          <section>
+            <div className="text-[10px] text-muted font-medium mb-1 uppercase flex items-center gap-1"><Clock size={10} /> Performance</div>
+            <div className="space-y-1 bg-gray-50 rounded p-1.5">
+              <PerfRow label="Send -> First event" value={formatDuration(currentPerf?.firstEventAt && currentPerf?.sendAt ? currentPerf.firstEventAt - currentPerf.sendAt : lastPerf?.firstEventAt && lastPerf?.sendAt ? lastPerf.firstEventAt - lastPerf.sendAt : null)} />
+              <PerfRow label="Send -> First tool" value={formatDuration(currentPerf?.firstToolAt && currentPerf?.sendAt ? currentPerf.firstToolAt - currentPerf.sendAt : lastPerf?.firstToolAt && lastPerf?.sendAt ? lastPerf.firstToolAt - lastPerf.sendAt : null)} />
+              <PerfRow label="Send -> First paint" value={formatDuration(currentPerf?.firstVisibleRenderAt && currentPerf?.sendAt ? currentPerf.firstVisibleRenderAt - currentPerf.sendAt : lastPerf?.firstVisibleRenderAt && lastPerf?.sendAt ? lastPerf.firstVisibleRenderAt - lastPerf.sendAt : null)} />
+              <PerfRow label="Send -> Settled" value={formatDuration(currentPerf?.settledAt && currentPerf?.sendAt ? currentPerf.settledAt - currentPerf.sendAt : lastPerf?.settledAt && lastPerf?.sendAt ? lastPerf.settledAt - lastPerf.sendAt : null)} />
+            </div>
+          </section>
+        )}
 
         {toolCounts.length > 0 && (
           <section>

@@ -40,6 +40,10 @@ export default function BehaviorTab({ activeId }: Props) {
     }
   }, [setSettings, activeId]);
 
+  const handleQueueWhileRunning = useCallback((enabled: boolean) => {
+    setSettings({ queueWhileRunning: enabled });
+  }, [setSettings]);
+
   return (
     <div className="space-y-4">
       <ToggleRow
@@ -53,6 +57,12 @@ export default function BehaviorTab({ activeId }: Props) {
         description="Automatically retry on transient failures"
         checked={settings.autoRetry}
         onChange={handleAutoRetry}
+      />
+      <ToggleRow
+        label={st("queueWhileRunning")}
+        description="While a task is running, sent messages wait in a queue and are sent automatically when it finishes (instead of steering the agent mid-turn)"
+        checked={settings.queueWhileRunning}
+        onChange={handleQueueWhileRunning}
       />
 
       <div className="border-t border-border pt-3">

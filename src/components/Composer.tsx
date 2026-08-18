@@ -1,7 +1,9 @@
-import { useRef, useCallback, useState, KeyboardEvent } from "react";
+import { useRef, useCallback, useState, KeyboardEvent, ClipboardEvent } from "react";
 import { usePiDeskStore } from "../store/pidesk";
 import { Send, Square, Mic, MicOff, Paperclip, X } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { readImage as readClipboardImage } from "@tauri-apps/plugin-clipboard-manager";
 
 const SpeechRecognitionAPI = (window as unknown as Record<string, unknown>).SpeechRecognition ||
   (window as unknown as Record<string, unknown>).webkitSpeechRecognition;
@@ -19,7 +21,12 @@ export default function Composer({ onSend, onAbort }: Props) {
   const addInputImage = usePiDeskStore((s) => s.addInputImage);
   const removeInputImage = usePiDeskStore((s) => s.removeInputImage);
   const sessions = usePiDeskStore((s) => s.sessions);
+  const settings = usePiDeskStore((s) => s.settings);
+  const pendingQueues = usePiDeskStore((s) => s.pendingQueues);
   const isStreaming = activeId ? sessions[activeId]?.status === "streaming" : false;
+  const runningStatus = activeId ? sessions[activeId]?.status : "idle";
+  const pendingCount = activeId ? (pendingQueues[activeId] || []).length : 0;
+  const queueHint = settings.queueWhileRunning && (runningStatus === "streaming" || runningStatus === "compacting" || runningStatus === "retrying");
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const recognitionRef = useRef<unknown>(null);
@@ -43,6 +50,91 @@ export default function Composer({ onSend, onAbort }: Props) {
       if (!inputImages.includes(path)) addInputImage(path);
     }
   }, [inputImages, addInputImage]);
+
+  // ── Paste image from clipboard ──
+  const addPastedImage = useCallback(async (bytes: Uint8Array, mimeType: string) => {
+    // Map MIME type to a safe file extension
+    const extMap: Record<string, string> = {
+      "image/png": "png",
+      "image/jpeg": "jpg",
+      "image/gif": "gif",
+      "image/webp": "webp",
+      "image/bmp": "bmp",
+    };
+    const ext = extMap[mimeType] ?? "png";
+    // Base64-encode without data: prefix (Chunked to avoid call-stack limits on large images)
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    const dataBase64 = btoa(binary);
+    try {
+      const path = await invoke<string>("save_pasted_image", { dataBase64, ext });
+      if (inputImages.includes(path)) return;
+      addInputImage(path);
+      usePiDeskStore.getState().addToast({
+        type: "success",
+        title: "Image pasted",
+        message: "The pasted image has been attached. Press Enter to send.",
+        durationMs: 3000,
+      });
+    } catch (err) {
+      console.error("Failed to save pasted image:", err);
+      usePiDeskStore.getState().addToast({
+        type: "error",
+        title: "Paste failed",
+        message: String(err),
+        durationMs: 5000,
+      });
+    }
+  }, [inputImages, addInputImage]);
+
+  const handlePaste = useCallback(async (e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    let file: File | null = null;
+    let mimeType = "";
+    if (items) {
+      for (const item of Array.from(items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          file = item.getAsFile();
+          mimeType = item.type;
+          if (file) break;
+        }
+      }
+    }
+    if (!file) {
+      // Fallback: read straight from the OS clipboard via the Tauri plugin (RGBA)
+      try {
+        const img = await readClipboardImage();
+        const rgba = new Uint8Array(await img.rgba());
+        const { width, height } = await img.size();
+        e.preventDefault();
+        try {
+          const path = await invoke<string>("save_pasted_rgba", {
+            rgba: Array.from(rgba),
+            width,
+            height,
+          });
+          if (!inputImages.includes(path)) addInputImage(path);
+        } catch (err) {
+          console.error("Failed to save pasted RGBA image:", err);
+          usePiDeskStore.getState().addToast({
+            type: "error",
+            title: "Paste failed",
+            message: String(err),
+            durationMs: 5000,
+          });
+        }
+      } catch {
+        return; // no image on the clipboard — let the default text paste proceed
+      }
+      return;
+    }
+    e.preventDefault();
+    const buf = new Uint8Array(await file.arrayBuffer());
+    addPastedImage(buf, mimeType);
+  }, [addPastedImage, inputImages, addInputImage]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -101,6 +193,17 @@ export default function Composer({ onSend, onAbort }: Props) {
 
   return (
     <div className="border-t border-border bg-surface px-3 py-2 shrink-0">
+      {pendingCount > 0 && (
+        <div className="flex items-center justify-between max-w-4xl mx-auto mb-2 px-3 py-1 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md">
+          <span>{pendingCount} message{pendingCount > 1 ? "s" : ""} queued - will send after the current task finishes</span>
+          <button
+            onClick={() => activeId && usePiDeskStore.getState().clearPendingQueue(activeId)}
+            className="ml-3 text-amber-600 hover:text-amber-800 underline shrink-0"
+          >
+            Clear
+          </button>
+        </div>
+      )}
       {inputImages.length > 0 && (
         <div className="flex flex-wrap gap-1.5 max-w-4xl mx-auto mb-2">
           {inputImages.map((path) => (
@@ -133,7 +236,8 @@ export default function Composer({ onSend, onAbort }: Props) {
           value={inputValue}
           onChange={(e) => { setInputValue(e.target.value); adjustHeight(); }}
           onKeyDown={handleKeyDown}
-          placeholder={isListening ? "Listening..." : isStreaming ? "Steer the agent... (Esc to abort)" : "Type a message... (Enter to send, Shift+Enter for newline)"}
+          onPaste={handlePaste}
+          placeholder={isListening ? "Listening..." : queueHint ? "Task running - messages will be queued and auto-sent when it finishes... (Esc to abort)" : isStreaming ? "Steer the agent... (Esc to abort)" : "Type a message... (Enter to send, Shift+Enter for newline)"}
           rows={1}
           className="flex-1 resize-none rounded-md border border-border px-3 py-1.5 text-sm
                      bg-white focus:outline-none focus:border-border-focus focus:ring-1 focus:ring-border-focus

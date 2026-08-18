@@ -1,12 +1,10 @@
 @echo off
 cd /d "%~dp0"
 
-set "PATH=%APPDATA%\npm;%PATH%"
-
-:: Verify Pi
-where pi >nul 2>&1
-if errorlevel 1 (
-    echo [PiDesk] pi not found. Run: npm install -g @earendil-works/pi-coding-agent
+:: Verify bundled Pi runtime (project is self-contained, no global pi needed)
+if not exist "src-tauri\pi-bundle\node.exe" (
+    echo [PiDesk] Bundled Pi runtime not found at src-tauri\pi-bundle
+    echo Run scripts\bundle-pi.bat first (or build-pidesk.bat).
     pause
     exit /b 1
 )

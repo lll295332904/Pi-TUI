@@ -23,11 +23,31 @@ pub fn run() {
         Ok(()) => logger.info("Per-user Windows registry initialized"),
         Err(error) => logger.warn(&format!("Per-user Windows registry initialization skipped: {}", error)),
     }
+    match windows_setup::ensure_aumid_registration() {
+        Ok(()) => logger.info("AppUserModelID registration ensured"),
+        Err(error) => logger.warn(&format!("AppUserModelID registration skipped: {}", error)),
+    }
+
+    // Windows toast notifications require a stable AppUserModelID on the
+    // process. The installed app sets it via the bundle, but dev mode does
+    // not, so set it explicitly to make system notifications work there too.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+        let app_id: Vec<u16> = "com.pidesk.app".encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: app_id is a null-terminated UTF-16 buffer valid for the call duration.
+        unsafe {
+            let _ = SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
+        }
+    }
+
     let kernel_shutdown = kernel.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState { kernel, logger })
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -83,6 +103,9 @@ pub fn run() {
             commands::providers::fetch_models_from_url,
             commands::userdata::save_userdata,
             commands::userdata::load_userdata,
+            commands::clipboard::save_pasted_image,
+            commands::clipboard::save_pasted_rgba,
+            commands::images::image_to_data_url,
             commands::diagnostics::run_startup_diagnostics,
             commands::diagnostics::export_diagnostics,
         ])

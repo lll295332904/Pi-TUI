@@ -1,5 +1,6 @@
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Serialize)]
 pub struct AvailableModel {
@@ -7,8 +8,11 @@ pub struct AvailableModel {
     pub id: String,
     pub name: String,
     pub reasoning: bool,
+    #[serde(rename = "contextWindow")]
     pub context_window: u64,
+    #[serde(rename = "supportsVision")]
     pub supports_vision: bool,
+    #[serde(rename = "thinkingLevels")]
     pub thinking_levels: Vec<String>,
 }
 
@@ -17,102 +21,94 @@ fn get_pi_agent_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(&home).join(".pi").join("agent")
 }
 
-fn sync_models_json() -> AppResult<()> {
+/// Merge the user model catalog (`models.json`) over the directory catalog
+/// (`models-store.json`) following Pi's documented merge semantics
+/// (docs/models.md → "Overriding Built-in Providers"):
+///   - directory models are the base
+///   - user models are upserted by `id` per provider
+///   - a user model with the same `id` replaces the directory model
+///   - user provider-level fields (`baseUrl`/`api`/`compat`/`name`/`apiKey`) win
+///
+/// Returns a merged catalog in `models-store.json` shape: `{ provider: { models: [...] } }`.
+/// This is the SINGLE source of truth for the UI — the UI shows exactly what
+/// the Pi kernel sees, and user overrides are never clobbered.
+fn merge_catalog() -> AppResult<serde_json::Value> {
     let agent_dir = get_pi_agent_dir();
     let store_path = agent_dir.join("models-store.json");
-    let models_json_path = agent_dir.join("models.json");
+    let user_path = agent_dir.join("models.json");
 
-    if !store_path.exists() {
-        return Ok(());
+    // Base: directory catalog
+    let mut merged: serde_json::Value = if store_path.exists() {
+        std::fs::read_to_string(&store_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !merged.is_object() {
+        merged = serde_json::json!({});
     }
-    let store: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&store_path)
-            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models-store.json: {}", e) })?, 
-    )
-    .map_err(|e| AppError::ConfigReadFailed { detail: format!("Invalid models-store.json: {}", e) })?;
 
-    let mut models_json: serde_json::Value = if models_json_path.exists() {
-        std::fs::read_to_string(&models_json_path)
+    // Overlay: user catalog (wins on conflicts)
+    let user: serde_json::Value = if user_path.exists() {
+        std::fs::read_to_string(&user_path)
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or(serde_json::json!({ "providers": {} }))
     } else {
         serde_json::json!({ "providers": {} })
     };
-    if !models_json.is_object() {
-        models_json = serde_json::json!({ "providers": {} });
-    }
-    if models_json.get_mut("providers").and_then(|p| p.as_object_mut()).is_none() {
-        models_json["providers"] = serde_json::json!({});
-    }
-    let providers = models_json["providers"].as_object_mut().unwrap();
 
-    if let Some(store_obj) = store.as_object() {
-        for (pid, entry) in store_obj {
-            let checked_at = entry.get("checkedAt");
-            let managed = checked_at.map(|v| v.is_null()).unwrap_or(true);
-            let models = entry.get("models").and_then(|m| m.as_array());
-            let has_models = models.map(|a| !a.is_empty()).unwrap_or(false);
-            if !managed || !has_models {
-                continue;
+    if let Some(user_providers) = user.get("providers").and_then(|p| p.as_object()) {
+        let merged_obj = merged.as_object_mut().unwrap();
+        for (pid, user_provider) in user_providers {
+            let mut entry = merged_obj
+                .get(pid)
+                .cloned()
+                .unwrap_or(serde_json::json!({ "models": [] }));
+            if !entry.is_object() {
+                entry = serde_json::json!({ "models": [] });
             }
-            let model_list = models.unwrap();
-            let models_defs: Vec<serde_json::Value> = model_list
-                .iter()
-                .map(|m| {
-                    let mut def = serde_json::Map::new();
-                    for key in [
-                        "id", "name", "api", "baseUrl", "reasoning",
-                        "thinkingLevelMap", "input", "cost", "contextWindow",
-                        "maxTokens", "compat",
-                    ] {
-                        if let Some(v) = m.get(key) {
-                            def.insert(key.to_string(), v.clone());
-                        }
-                    }
-                    serde_json::Value::Object(def)
-                })
-                .collect();
+            let entry_obj = entry.as_object_mut().unwrap();
 
-            let mut p = serde_json::Map::new();
-            p.insert("name".to_string(), serde_json::json!(pid));
-            if let Some(b) = model_list.first().and_then(|m| m.get("baseUrl")).cloned() {
-                p.insert("baseUrl".to_string(), b);
+            // Upsert user models by id (user model replaces directory model with same id)
+            if let Some(u_models) = user_provider.get("models").and_then(|m| m.as_array()) {
+                let mut base_models: Vec<serde_json::Value> = entry_obj
+                    .get("models")
+                    .and_then(|m| m.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for u_model in u_models {
+                    let uid = u_model.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    base_models.retain(|bm| bm.get("id").and_then(|v| v.as_str()) != Some(uid));
+                    base_models.push(u_model.clone());
+                }
+                entry_obj.insert("models".to_string(), serde_json::Value::Array(base_models));
             }
-            if let Some(a) = model_list.first().and_then(|m| m.get("api")).cloned() {
-                p.insert("api".to_string(), a);
+
+            // Provider-level user overrides win over directory values
+            for key in ["name", "baseUrl", "api", "compat", "apiKey"] {
+                if let Some(v) = user_provider.get(key) {
+                    entry_obj.insert(key.to_string(), v.clone());
+                }
             }
-            if let Some(c) = model_list.first().and_then(|m| m.get("compat")).cloned() {
-                p.insert("compat".to_string(), c);
-            }
-            p.insert("models".to_string(), serde_json::Value::Array(models_defs));
-            providers.insert(pid.clone(), serde_json::Value::Object(p));
+
+            merged_obj.insert(pid.clone(), entry);
         }
     }
 
-    let updated = serde_json::to_string_pretty(&models_json)
-        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Serialize models.json error: {}", e) })?;
-    std::fs::write(&models_json_path, updated)
-        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write models.json: {}", e) })?;
-    Ok(())
+    Ok(merged)
 }
 
 #[tauri::command]
 pub fn get_available_models() -> AppResult<Vec<AvailableModel>> {
-    let _ = sync_models_json();
-
-    let models_store = get_pi_agent_dir().join("models-store.json");
-    if !models_store.exists() {
-        return Ok(vec![]);
-    }
-
-    let content = std::fs::read_to_string(&models_store)
-        .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models-store.json: {}", e) })?;
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| AppError::ConfigReadFailed { detail: format!("Invalid JSON in models-store.json: {}", e) })?;
+    // Read the merged catalog (directory + user models, user wins).
+    // The UI therefore shows exactly what the Pi kernel sees.
+    let catalog = merge_catalog()?;
 
     let mut models = Vec::new();
-    if let Some(providers) = json.as_object() {
+    if let Some(providers) = catalog.as_object() {
         for (provider_name, provider_data) in providers {
             let model_list = provider_data.get("models");
             if let Some(model_arr) = model_list.and_then(|m| m.as_array()) {
@@ -126,11 +122,15 @@ pub fn get_available_models() -> AppResult<Vec<AvailableModel>> {
                         .map(|arr| arr.iter().any(|t| t.as_str() == Some("image")))
                         .unwrap_or(false);
 
+                    // Only list thinking levels whose map value is non-null.
+                    // A null value means the level is unsupported (Pi semantics).
                     let mut thinking_levels = Vec::new();
                     if let Some(tlm) = model.get("thinkingLevelMap").and_then(|v| v.as_object()) {
                         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
-                            if tlm.contains_key(level) {
-                                thinking_levels.push(level.to_string());
+                            if let Some(v) = tlm.get(level) {
+                                if !v.is_null() {
+                                    thinking_levels.push(level.to_string());
+                                }
                             }
                         }
                     }
@@ -189,33 +189,43 @@ fn backup_file(path: &std::path::Path) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn add_model(params: NewModelParams) -> AppResult<()> {
+pub fn add_model(app: AppHandle, params: NewModelParams) -> AppResult<()> {
     let agent_dir = get_pi_agent_dir();
     std::fs::create_dir_all(&agent_dir)
         .map_err(|e| AppError::UserDataNotAccessible { detail: format!("Cannot create ~/.pi/agent: {}", e) })?;
 
-    let models_path = agent_dir.join("models-store.json");
+    // User models live in models.json (the file Pi treats as user-defined).
+    // Directory models in models-store.json stay untouched.
+    let models_path = agent_dir.join("models.json");
     let _ = backup_file(&models_path);
 
-    let mut models_store: serde_json::Value = if models_path.exists() {
+    let mut models_json: serde_json::Value = if models_path.exists() {
         let content = std::fs::read_to_string(&models_path)
-            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models-store.json: {}", e) })?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models.json: {}", e) })?;
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({ "providers": {} }))
     } else {
-        serde_json::json!({})
+        serde_json::json!({ "providers": {} })
     };
+    if !models_json.is_object() {
+        models_json = serde_json::json!({ "providers": {} });
+    }
+    if models_json.get_mut("providers").and_then(|p| p.as_object_mut()).is_none() {
+        models_json["providers"] = serde_json::json!({});
+    }
 
+    // Full thinking map for reasoning models (all levels usable), off-only otherwise.
+    // Values must be non-null: null means the level is unsupported (Pi semantics).
     let thinking_level_map = if params.reasoning {
         serde_json::json!({
-            "off": null,
-            "minimal": null,
-            "low": null,
-            "medium": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
             "high": "high",
+            "xhigh": "max",
             "max": "max"
         })
     } else {
-        serde_json::json!({ "off": null })
+        serde_json::json!({ "off": "off" })
     };
 
     let mut input_types = vec!["text"];
@@ -234,7 +244,6 @@ pub fn add_model(params: NewModelParams) -> AppResult<()> {
         "name": params.display_name,
         "api": params.api_type,
         "baseUrl": params.api_base_url,
-        "provider": params.provider,
         "reasoning": params.reasoning,
         "input": input_types,
         "contextWindow": params.context_window,
@@ -249,15 +258,11 @@ pub fn add_model(params: NewModelParams) -> AppResult<()> {
         }
     });
 
-    let provider_entry = models_store
-        .get_mut(&params.provider)
+    let providers = models_json["providers"].as_object_mut().unwrap();
+    let provider_entry = providers
+        .get(&params.provider)
         .cloned()
-        .unwrap_or(serde_json::json!({
-            "models": [],
-            "checkedAt": null,
-            "lastModified": null
-        }));
-
+        .unwrap_or(serde_json::json!({ "models": [] }));
     let mut provider_obj = provider_entry.as_object().cloned().unwrap_or_default();
     let models_arr = provider_obj
         .get("models")
@@ -272,12 +277,16 @@ pub fn add_model(params: NewModelParams) -> AppResult<()> {
     updated_models.push(new_model);
 
     provider_obj.insert("models".into(), serde_json::Value::Array(updated_models));
-    models_store[&params.provider] = serde_json::Value::Object(provider_obj);
+    // Provider-level connection info so the model is actually usable
+    provider_obj.insert("api".into(), serde_json::json!(params.api_type));
+    provider_obj.insert("baseUrl".into(), serde_json::json!(params.api_base_url));
+    provider_obj.insert("compat".into(), compat);
+    providers.insert(params.provider.clone(), serde_json::Value::Object(provider_obj));
 
-    let updated_json = serde_json::to_string_pretty(&models_store)
+    let updated_json = serde_json::to_string_pretty(&models_json)
         .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Serialize error: {}", e) })?;
     std::fs::write(&models_path, &updated_json)
-        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write models-store.json: {}", e) })?;
+        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write models.json: {}", e) })?;
 
     if let Some(ref key) = params.api_key {
         if !key.trim().is_empty() {
@@ -304,37 +313,68 @@ pub fn add_model(params: NewModelParams) -> AppResult<()> {
         }
     }
 
-    let _ = sync_models_json();
+    // Broadcast so the UI can refresh the model list without a restart
+    let _ = app.emit("models:changed", ());
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_model(provider: String, model_id: String) -> AppResult<()> {
-    let models_path = get_pi_agent_dir().join("models-store.json");
-    if models_path.exists() {
-        let _ = std::fs::copy(&models_path, models_path.with_extension("json.bak"));
-    }
-    let content = std::fs::read_to_string(&models_path)
-        .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read: {}", e) })?;
-    let mut store: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| AppError::ConfigReadFailed { detail: format!("Invalid JSON: {}", e) })?;
-    if let Some(provider_obj) = store.get_mut(&provider) {
-        if let Some(models) = provider_obj.get_mut("models") {
-            if let Some(arr) = models.as_array_mut() {
-                arr.retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(&model_id));
-            }
-        }
-        if provider_obj.get("models").and_then(|m| m.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
-            if let Some(obj) = store.as_object_mut() {
-                obj.remove(&provider);
-            }
-        }
-    }
-    let updated = serde_json::to_string_pretty(&store)
-        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Serialize error: {}", e) })?;
-    std::fs::write(&models_path, &updated)
-        .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write: {}", e) })?;
+pub fn remove_model(app: AppHandle, provider: String, model_id: String) -> AppResult<()> {
+    let agent_dir = get_pi_agent_dir();
 
-    let _ = sync_models_json();
+    // 1) Remove the user definition from models.json (user layer)
+    let user_path = agent_dir.join("models.json");
+    if user_path.exists() {
+        let _ = backup_file(&user_path);
+        let content = std::fs::read_to_string(&user_path)
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models.json: {}", e) })?;
+        let mut user: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Invalid JSON in models.json: {}", e) })?;
+        if let Some(providers) = user.get_mut("providers").and_then(|p| p.as_object_mut()) {
+            if let Some(provider_obj) = providers.get_mut(&provider) {
+                if let Some(models) = provider_obj.get_mut("models") {
+                    if let Some(arr) = models.as_array_mut() {
+                        arr.retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(&model_id));
+                    }
+                }
+                if provider_obj.get("models").and_then(|m| m.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+                    providers.remove(&provider);
+                }
+            }
+        }
+        let updated = serde_json::to_string_pretty(&user)
+            .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Serialize error: {}", e) })?;
+        std::fs::write(&user_path, &updated)
+            .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write models.json: {}", e) })?;
+    }
+
+    // 2) Also drop directory-catalog copies (idempotent; keeps the UI list accurate)
+    let store_path = agent_dir.join("models-store.json");
+    if store_path.exists() {
+        let _ = backup_file(&store_path);
+        let content = std::fs::read_to_string(&store_path)
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Cannot read models-store.json: {}", e) })?;
+        let mut store: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| AppError::ConfigReadFailed { detail: format!("Invalid JSON in models-store.json: {}", e) })?;
+        if let Some(provider_obj) = store.get_mut(&provider) {
+            if let Some(models) = provider_obj.get_mut("models") {
+                if let Some(arr) = models.as_array_mut() {
+                    arr.retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(&model_id));
+                }
+            }
+            if provider_obj.get("models").and_then(|m| m.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+                if let Some(obj) = store.as_object_mut() {
+                    obj.remove(&provider);
+                }
+            }
+        }
+        let updated = serde_json::to_string_pretty(&store)
+            .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Serialize error: {}", e) })?;
+        std::fs::write(&store_path, &updated)
+            .map_err(|e| AppError::ConfigWriteFailed { detail: format!("Cannot write models-store.json: {}", e) })?;
+    }
+
+    // Broadcast so the UI can refresh the model list without a restart
+    let _ = app.emit("models:changed", ());
     Ok(())
 }

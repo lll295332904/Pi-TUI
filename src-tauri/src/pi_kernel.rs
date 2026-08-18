@@ -59,12 +59,34 @@ pub type PiResult<T> = Result<T, PiError>;
 
 // ── JSONL message types ──
 
+/// An inline image attachment. Pi's RPC protocol expects images as content
+/// parts (`{ type: "image", mimeType, data }` with base64 data) — NOT file
+/// paths. Sending raw paths silently corrupts the user message content.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageContent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl ImageContent {
+    pub fn new(mime_type: &str, data_base64: String) -> Self {
+        Self {
+            kind: "image".into(),
+            mime_type: mime_type.to_string(),
+            data: data_base64,
+        }
+    }
+}
+
 /// Request sent to Pi stdin
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum PiRequest {
     #[serde(rename = "prompt")]
-    Prompt { message: String, images: Vec<String> },
+    Prompt { message: String, images: Vec<ImageContent> },
     #[serde(rename = "steer")]
     Steer { message: String },
     #[serde(rename = "follow_up")]
@@ -505,5 +527,29 @@ impl PiKernelManager {
         self.sessions.insert(session_id.to_string(), session);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_serializes_images_as_content_parts() {
+        let req = PiRequest::Prompt {
+            message: "describe this".into(),
+            images: vec![ImageContent::new("image/png", "aGVsbG8=".to_string())],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let parsed: Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["type"], "prompt");
+        assert_eq!(parsed["message"], "describe this");
+        // Pi's rpc-mode expects `images` to be ImageContent parts:
+        // { type: "image", mimeType, data } — NOT file paths.
+        let img = &parsed["images"][0];
+        assert_eq!(img["type"], "image");
+        assert_eq!(img["mimeType"], "image/png");
+        assert_eq!(img["data"], "aGVsbG8=");
+        assert!(img.get("mime_type").is_none(), "must use camelCase mimeType");
     }
 }

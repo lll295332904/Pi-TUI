@@ -11,32 +11,65 @@ import type {
   ExtensionUiRequest,
   PiDeskSettings,
   RoleModels,
+  RoleThinkingLevels,
   ModelRef,
+  PendingQueueItem,
   ProjectVM,
   PinnedItems,
   ToastItem,
+  RequestPerformance,
 } from "../types";
+
+/**
+ * Recommended per-role models (P1 optimization, 2026-08-10).
+ * main/subAgent → strongest reasoning model; vision → the only vision-capable
+ * model; everything else → fast/cheap flash. References must exist in the model
+ * catalog, otherwise refreshModels() sanitizes them away on startup.
+ */
+const DEFAULT_ROLE_MODELS: RoleModels = {
+  main: { provider: "deepseek", id: "deepseek-v4-pro" },
+  vision: { provider: "小米mimo", id: "mimo-v2.5" },
+  web: { provider: "deepseek", id: "deepseek-v4-flash" },
+  compression: { provider: "deepseek", id: "deepseek-v4-flash" },
+  skills: { provider: "deepseek", id: "deepseek-v4-flash" },
+  approval: { provider: "deepseek", id: "deepseek-v4-flash" },
+  title: { provider: "deepseek", id: "deepseek-v4-flash" },
+  maintenance: { provider: "deepseek", id: "deepseek-v4-flash" },
+  mcp: { provider: "deepseek", id: "deepseek-v4-flash" },
+  subAgent: { provider: "deepseek", id: "deepseek-v4-pro" },
+};
+
+/**
+ * Recommended per-role thinking levels. All roles default to "medium"
+ * (unified default per product decision): heavy and light tasks share the
+ * same thinking level unless the user overrides per-role.
+ * deepseek exposes off/low/medium/high/max via the unified thinkingLevelMap.
+ */
+const DEFAULT_ROLE_THINKING_LEVELS: RoleThinkingLevels = {
+  main: "medium",
+  vision: "medium",
+  web: "medium",
+  compression: "medium",
+  skills: "medium",
+  approval: "medium",
+  title: "medium",
+  maintenance: "medium",
+  mcp: "medium",
+  subAgent: "medium",
+};
 
 const DEFAULT_SETTINGS: PiDeskSettings = {
   defaultModel: null,
+  // Unified default thinking level: "medium" (matches Pi global settings.json).
   defaultThinkingLevel: "medium",
   defaultCwd: "C:\\Git",
   autoCompaction: true,
   autoRetry: true,
   steeringMode: "all",
   followUpMode: "all",
-  roleModels: {
-    main: null,
-    vision: null,
-    web: null,
-    compression: null,
-    skills: null,
-    approval: null,
-    title: null,
-    maintenance: null,
-    mcp: null,
-    subAgent: null,
-  },
+  queueWhileRunning: true,
+  roleModels: DEFAULT_ROLE_MODELS,
+  roleThinkingLevels: DEFAULT_ROLE_THINKING_LEVELS,
 };
 
 interface PiDeskState {
@@ -44,6 +77,7 @@ interface PiDeskState {
   activeSessionId: string | null;
   sessions: Record<string, SessionVM>;
   sessionTimelines: Record<string, TimelineItem[]>;
+  sessionTimelineIndexes: Record<string, Record<string, number>>;
   historicalSessions: PiSessionMeta[];
   pendingApproval: ApprovalRequestVM | null;
 
@@ -55,6 +89,13 @@ interface PiDeskState {
 
   // Extension UI requests (approvals, confirms, etc.)
   extensionUiRequests: ExtensionUiRequest[];
+
+  // Per-session pending message queues (queue-while-running mode, not persisted)
+  pendingQueues: Record<string, PendingQueueItem[]>;
+  enqueuePending: (sessionId: string, item: PendingQueueItem) => void;
+  /** Removes and returns the head of the queue, or null when empty. */
+  shiftPending: (sessionId: string) => PendingQueueItem | null;
+  clearPendingQueue: (sessionId: string) => void;
 
   // App boot state
 
@@ -70,6 +111,10 @@ interface PiDeskState {
   // Pinned items (persisted)
   pinned: PinnedItems;
 
+  // Archived sessions (persisted) — keyed by persistent fileId (same rule as pinning).
+  // Archived sessions are hidden from the main lists and shown in the Archive section.
+  archivedSessions: string[];
+
   // UI
   sidebarOpen: boolean;
   inspectorOpen: boolean;
@@ -78,10 +123,12 @@ interface PiDeskState {
   consoleOpen: boolean;
   consoleLogs: Record<string, string[]>;  // sessionId → raw event JSON lines
   sessionUsage: Record<string, { inputTokens: number; outputTokens: number }>;
+  sessionRequestPerformance: Record<string, RequestPerformance>;
+  lastCompletedRequestPerformance: Record<string, RequestPerformance>;
   sessionWorkspaces: Record<string, string>; // cwd → workspaceCwd, persisted
+  sessionWorkspacesByFile: Record<string, string>; // fileId → workspaceCwd (per-session, precise; legacy cwd map is only a fallback)
   sessionContextUsage: Record<string, { usedTokens: number; maxTokens: number }>;
   sessionRoles: Record<string, string>; // sessionId → current role
-  globalRole: string; // fallback for TopBar display
 
   // Input
   inputValue: string;
@@ -113,6 +160,11 @@ interface PiDeskState {
   // Actions – timeline
   appendTimeline: (item: TimelineItem, sessionId?: string) => void;
   updateTimelineItem: (itemId: string, patch: Partial<TimelineItem>, sessionId?: string) => void;
+  markRequestSent: (sessionId: string, requestId: string, sendAt?: number) => void;
+  markRequestFirstEvent: (sessionId: string, at?: number) => void;
+  markRequestFirstTool: (sessionId: string, at?: number) => void;
+  markRequestSettled: (sessionId: string, at?: number) => void;
+  markRequestFirstVisibleRender: (sessionId: string, at?: number) => void;
   clearTimeline: () => void;
   loadHistoryEntries: (sessionId: string, entries: TimelineItem[]) => void;
   setHistoricalSessions: (list: PiSessionMeta[]) => void;
@@ -127,8 +179,8 @@ interface PiDeskState {
   setRoleModel: (role: keyof RoleModels, model: ModelRef | null) => void;
 
   // Current active role (for UI display)
-  currentRole: keyof RoleModels;
   setCurrentRole: (role: keyof RoleModels) => void;
+  setSessionRole: (sessionId: string, role: string) => void;
 
   // Actions – projects & pinning
   addProject: (cwd: string, name: string) => void;
@@ -137,6 +189,13 @@ interface PiDeskState {
   setActiveProject: (cwd: string | null) => void;
   togglePinProject: (cwd: string) => void;
   togglePinSession: (sessionId: string) => void;
+  togglePinSessionByFileId: (fileId: string) => void;
+  archiveSession: (sessionId: string) => void;
+  unarchiveSession: (sessionId: string) => void;
+  archiveSessionByFileId: (fileId: string) => void;
+  unarchiveSessionByFileId: (fileId: string) => void;
+  setSessionFileId: (sessionId: string, fileId: string) => void;
+  setSessionWorkspace: (key: string, workspaceCwd: string) => void;
   moveSessionToWorkspace: (sessionId: string, workspaceCwd: string) => void;
   detachSessionFromWorkspace: (sessionId: string) => void;
 
@@ -162,16 +221,18 @@ export const usePiDeskStore = create<PiDeskState>()(
       activeSessionId: null,
       sessions: {},
       sessionTimelines: {},
+      sessionTimelineIndexes: {},
       historicalSessions: [],
       pendingApproval: null,
       sessionNames: {},
       availableModels: [],
       extensionUiRequests: [],
+      pendingQueues: {},
       settings: DEFAULT_SETTINGS,
       projects: {},
       activeProjectCwd: null,
       pinned: { sessions: [], projects: [] },
-      currentRole: "main" as keyof RoleModels,
+      archivedSessions: [],
       sidebarOpen: true,
       inspectorOpen: false,
       settingsOpen: false,
@@ -180,10 +241,12 @@ export const usePiDeskStore = create<PiDeskState>()(
       consoleOpen: false,
       consoleLogs: {},
       sessionUsage: {},
+      sessionRequestPerformance: {},
+      lastCompletedRequestPerformance: {},
       sessionWorkspaces: {},
+      sessionWorkspacesByFile: {},
       sessionContextUsage: {},
       sessionRoles: {},
-      globalRole: "main",
       modelSwitching: {},
       language: "zh",
       inputValue: "",
@@ -227,11 +290,19 @@ export const usePiDeskStore = create<PiDeskState>()(
         set((s) => {
           const { [id]: _, ...restSessions } = s.sessions;
           const { [id]: __, ...restTimelines } = s.sessionTimelines;
-          const { [id]: ___, ...restNames } = s.sessionNames;
+          const { [id]: ___, ...restIndexes } = s.sessionTimelineIndexes;
+          const { [id]: ____, ...restPerf } = s.sessionRequestPerformance;
+          const { [id]: _____, ...restCompletedPerf } = s.lastCompletedRequestPerformance;
+          const { [id]: ______, ...restNames } = s.sessionNames;
+          const { [id]: _______, ...restWsByFile } = s.sessionWorkspacesByFile;
           return {
             sessions: restSessions,
             sessionTimelines: restTimelines,
+            sessionTimelineIndexes: restIndexes,
+            sessionRequestPerformance: restPerf,
+            lastCompletedRequestPerformance: restCompletedPerf,
             sessionNames: restNames,
+            sessionWorkspacesByFile: restWsByFile,
             activeSessionId: s.activeSessionId === id ? null : s.activeSessionId,
           };
         }),
@@ -264,12 +335,16 @@ export const usePiDeskStore = create<PiDeskState>()(
         }),
 
       setSessionContextUsage: (id, usedTokens, maxTokens) =>
-        set((s) => ({
-          sessionContextUsage: {
-            ...s.sessionContextUsage,
-            [id]: { usedTokens, maxTokens },
-          },
-        })),
+        set((s) => {
+          const next = {
+            sessionContextUsage: {
+              ...s.sessionContextUsage,
+              [id]: { usedTokens, maxTokens },
+            },
+          };
+          saveManual(next);
+          return next;
+        }),
 
       setModelSwitching: (id, ref) =>
         set((s) => {
@@ -284,10 +359,17 @@ export const usePiDeskStore = create<PiDeskState>()(
           const targetSessionId = sessionId || s.activeSessionId;
           if (!targetSessionId) return s;
           const current = s.sessionTimelines[targetSessionId] || [];
+          const nextIndex = current.length;
+          const itemId = item.type === "tool" ? item.toolCallId : item.type === "system-info" ? null : item.id;
+          const sessionIndex = s.sessionTimelineIndexes[targetSessionId] || {};
           return {
             sessionTimelines: {
               ...s.sessionTimelines,
               [targetSessionId]: [...current, item],
+            },
+            sessionTimelineIndexes: {
+              ...s.sessionTimelineIndexes,
+              [targetSessionId]: itemId ? { ...sessionIndex, [itemId]: nextIndex } : sessionIndex,
             },
           };
         }),
@@ -297,14 +379,75 @@ export const usePiDeskStore = create<PiDeskState>()(
           const targetSessionId = sessionId || s.activeSessionId;
           if (!targetSessionId) return s;
           const current = s.sessionTimelines[targetSessionId] || [];
+          const index = s.sessionTimelineIndexes[targetSessionId]?.[itemId];
+          if (index == null || !current[index]) return s;
+          const next = current.slice();
+          next[index] = { ...next[index], ...patch } as TimelineItem;
           return {
             sessionTimelines: {
               ...s.sessionTimelines,
-              [targetSessionId]: current.map((t) => {
-                const id = t.type === "tool" ? t.toolCallId : (t as { id: string }).id;
-                if (id === itemId) return { ...t, ...patch } as TimelineItem;
-                return t;
-              }),
+              [targetSessionId]: next,
+            },
+          };
+        }),
+
+      markRequestSent: (sessionId, requestId, sendAt = Date.now()) =>
+        set((s) => ({
+          sessionRequestPerformance: {
+            ...s.sessionRequestPerformance,
+            [sessionId]: { requestId, sendAt },
+          },
+        })),
+
+      markRequestFirstEvent: (sessionId, at = Date.now()) =>
+        set((s) => {
+          const current = s.sessionRequestPerformance[sessionId];
+          if (!current || current.firstEventAt) return s;
+          return {
+            sessionRequestPerformance: {
+              ...s.sessionRequestPerformance,
+              [sessionId]: { ...current, firstEventAt: at },
+            },
+          };
+        }),
+
+      markRequestFirstTool: (sessionId, at = Date.now()) =>
+        set((s) => {
+          const current = s.sessionRequestPerformance[sessionId];
+          if (!current || current.firstToolAt) return s;
+          return {
+            sessionRequestPerformance: {
+              ...s.sessionRequestPerformance,
+              [sessionId]: { ...current, firstToolAt: at },
+            },
+          };
+        }),
+
+      markRequestSettled: (sessionId, at = Date.now()) =>
+        set((s) => {
+          const current = s.sessionRequestPerformance[sessionId];
+          if (!current) return s;
+          const completed = { ...current, settledAt: current.settledAt ?? at };
+          return {
+            sessionRequestPerformance: {
+              ...s.sessionRequestPerformance,
+              [sessionId]: completed,
+            },
+            lastCompletedRequestPerformance: {
+              ...s.lastCompletedRequestPerformance,
+              [sessionId]: completed,
+            },
+          };
+        }),
+
+      markRequestFirstVisibleRender: (sessionId, at = Date.now()) =>
+        set((s) => {
+          const current = s.sessionRequestPerformance[sessionId];
+          if (!current || current.firstVisibleRenderAt) return s;
+          return {
+            sessionRequestPerformance: {
+              ...s.sessionRequestPerformance,
+              [sessionId]: { ...current, firstVisibleRenderAt: at },
             },
           };
         }),
@@ -317,16 +460,31 @@ export const usePiDeskStore = create<PiDeskState>()(
               ...s.sessionTimelines,
               [s.activeSessionId]: [],
             },
+            sessionTimelineIndexes: {
+              ...s.sessionTimelineIndexes,
+              [s.activeSessionId]: {},
+            },
           };
         }),
 
       loadHistoryEntries: (sessionId, entries) =>
-        set((s) => ({
-          sessionTimelines: {
-            ...s.sessionTimelines,
-            [sessionId]: entries,
-          },
-        })),
+        set((s) => {
+          const index: Record<string, number> = {};
+          entries.forEach((entry, idx) => {
+            const itemId = entry.type === "tool" ? entry.toolCallId : entry.type === "system-info" ? null : entry.id;
+            if (itemId) index[itemId] = idx;
+          });
+          return {
+            sessionTimelines: {
+              ...s.sessionTimelines,
+              [sessionId]: entries,
+            },
+            sessionTimelineIndexes: {
+              ...s.sessionTimelineIndexes,
+              [sessionId]: index,
+            },
+          };
+        }),
 
       setHistoricalSessions: (list) =>
         set({
@@ -334,6 +492,29 @@ export const usePiDeskStore = create<PiDeskState>()(
         }),
 
       setPendingApproval: (req) => set({ pendingApproval: req }),
+
+      enqueuePending: (sessionId, item) =>
+        set((s) => ({
+          pendingQueues: {
+            ...s.pendingQueues,
+            [sessionId]: [...(s.pendingQueues[sessionId] || []), item],
+          },
+        })),
+
+      shiftPending: (sessionId) => {
+        const q = usePiDeskStore.getState().pendingQueues[sessionId] || [];
+        if (q.length === 0) return null;
+        const [head, ...rest] = q;
+        usePiDeskStore.setState((s) => ({
+          pendingQueues: { ...s.pendingQueues, [sessionId]: rest },
+        }));
+        return head;
+      },
+
+      clearPendingQueue: (sessionId) =>
+        set((s) => ({
+          pendingQueues: { ...s.pendingQueues, [sessionId]: [] },
+        })),
 
       addExtensionUiRequest: (req) =>
         set((s) => ({
@@ -363,11 +544,11 @@ export const usePiDeskStore = create<PiDeskState>()(
       setCurrentRole: (role) =>
         set((s) => {
           const id = s.activeSessionId;
-          return {
-            globalRole: role,
-            ...(id ? { sessionRoles: { ...s.sessionRoles, [id]: role } } : {}),
-          };
+          return id ? { sessionRoles: { ...s.sessionRoles, [id]: role } } : {};
         }),
+
+      setSessionRole: (sessionId, role) =>
+        set((s) => ({ sessionRoles: { ...s.sessionRoles, [sessionId]: role } })),
 
       // ── Project & pin actions ──
 
@@ -410,10 +591,106 @@ export const usePiDeskStore = create<PiDeskState>()(
 
       togglePinSession: (sessionId) =>
         set((s) => {
-          const sessions = s.pinned.sessions.includes(sessionId)
-            ? s.pinned.sessions.filter((p) => p !== sessionId)
-            : [...s.pinned.sessions, sessionId];
+          // 置顶必须基于持久化的文件级 ID（fileId），而不是每次启动都变化的运行时 UUID，
+          // 否则重启后置顶会被当作孤儿清理掉。
+          const key = s.sessions[sessionId]?.fileId || sessionId;
+          const sessions = s.pinned.sessions.includes(key)
+            ? s.pinned.sessions.filter((p) => p !== key)
+            : [...s.pinned.sessions, key];
           const next = { pinned: { ...s.pinned, sessions } };
+          saveManual(next);
+          return next;
+        }),
+
+      // 按持久化 fileId 置顶/取消置顶（用于历史会话，它们没有运行时 UUID）
+      togglePinSessionByFileId: (fileId) =>
+        set((s) => {
+          const sessions = s.pinned.sessions.includes(fileId)
+            ? s.pinned.sessions.filter((p) => p !== fileId)
+            : [...s.pinned.sessions, fileId];
+          const next = { pinned: { ...s.pinned, sessions } };
+          saveManual(next);
+          return next;
+        }),
+
+      // ── Archive actions ──
+      // 归档按持久化 fileId 记录（与置顶同一规则），保证重启后归档不丢。
+      // 新会话在 fileId 同步前先用运行时 id，setSessionFileId 会自动迁移到 fileId。
+      archiveSession: (sessionId) =>
+        set((s) => {
+          const key = s.sessions[sessionId]?.fileId || sessionId;
+          if (s.archivedSessions.includes(key)) return s;
+          const next = { archivedSessions: [...s.archivedSessions, key] };
+          saveManual(next);
+          return next;
+        }),
+
+      unarchiveSession: (sessionId) =>
+        set((s) => {
+          const key = s.sessions[sessionId]?.fileId || sessionId;
+          if (!s.archivedSessions.includes(key)) return s;
+          const next = { archivedSessions: s.archivedSessions.filter((k) => k !== key) };
+          saveManual(next);
+          return next;
+        }),
+
+      // 按持久化 fileId 归档/取消归档（用于历史会话，它们没有运行时 UUID）
+      archiveSessionByFileId: (fileId) =>
+        set((s) => {
+          if (s.archivedSessions.includes(fileId)) return s;
+          const next = { archivedSessions: [...s.archivedSessions, fileId] };
+          saveManual(next);
+          return next;
+        }),
+
+      unarchiveSessionByFileId: (fileId) =>
+        set((s) => {
+          if (!s.archivedSessions.includes(fileId)) return s;
+          const next = { archivedSessions: s.archivedSessions.filter((k) => k !== fileId) };
+          saveManual(next);
+          return next;
+        }),
+
+      // 为会话补上持久化 fileId（新会话由 Pi 异步创建 .jsonl 文件后同步得到）。
+      // 若该会话此前以运行时 UUID 被置顶，自动迁移到 fileId，保证重启后置顶不丢。
+      setSessionFileId: (sessionId, fileId) =>
+        set((s) => {
+          const sess = s.sessions[sessionId];
+          if (!sess || sess.fileId === fileId) return s;
+          let pinnedSessions = s.pinned.sessions;
+          if (pinnedSessions.includes(sessionId)) {
+            pinnedSessions = pinnedSessions.filter((p) => p !== sessionId);
+            if (!pinnedSessions.includes(fileId)) pinnedSessions = [...pinnedSessions, fileId];
+          }
+          // 归档归属同样按会话 key 迁移：运行时 id → fileId
+          let archivedSessions = s.archivedSessions;
+          if (archivedSessions.includes(sessionId)) {
+            archivedSessions = archivedSessions.filter((k) => k !== sessionId);
+            if (!archivedSessions.includes(fileId)) archivedSessions = [...archivedSessions, fileId];
+          }
+          // 归属映射同样按会话 key 迁移：运行时 id → fileId
+          const wsByFile = { ...s.sessionWorkspacesByFile };
+          if (wsByFile[sessionId] != null) {
+            wsByFile[fileId] = wsByFile[sessionId];
+            delete wsByFile[sessionId];
+          }
+          const next = {
+            sessions: { ...s.sessions, [sessionId]: { ...sess, fileId } },
+            pinned: { ...s.pinned, sessions: pinnedSessions },
+            archivedSessions,
+            sessionWorkspacesByFile: wsByFile,
+          };
+          saveManual(next);
+          return next;
+        }),
+
+      // 记录会话的持久化工作区归属（key 为 fileId，fileId 同步前可先用运行时 id）
+      setSessionWorkspace: (key, workspaceCwd) =>
+        set((s) => {
+          if (s.sessionWorkspacesByFile[key] === workspaceCwd) return s;
+          const next = {
+            sessionWorkspacesByFile: { ...s.sessionWorkspacesByFile, [key]: workspaceCwd },
+          };
           saveManual(next);
           return next;
         }),
@@ -422,12 +699,14 @@ export const usePiDeskStore = create<PiDeskState>()(
         set((s) => {
           const sess = s.sessions[sessionId];
           if (!sess) return s;
+          // 按会话精确记录归属（同一 cwd 可有多个会话，不能按 cwd 一刀切）
+          const wsKey = sess.fileId || sessionId;
           const next = {
             sessions: {
               ...s.sessions,
               [sessionId]: { ...sess, workspaceCwd },
             },
-            sessionWorkspaces: { ...s.sessionWorkspaces, [sess.cwd]: workspaceCwd },
+            sessionWorkspacesByFile: { ...s.sessionWorkspacesByFile, [wsKey]: workspaceCwd },
           };
           saveManual(next);
           return next;
@@ -438,10 +717,11 @@ export const usePiDeskStore = create<PiDeskState>()(
           const sess = s.sessions[sessionId];
           if (!sess) return s;
           const { workspaceCwd: _, ...cleanSess } = sess;
-          const { [sess.cwd]: __, ...restWs } = s.sessionWorkspaces;
+          const wsKey = sess.fileId || sessionId;
+          const { [wsKey]: __, ...restWsByFile } = s.sessionWorkspacesByFile;
           const next = {
             sessions: { ...s.sessions, [sessionId]: cleanSess },
-            sessionWorkspaces: restWs,
+            sessionWorkspacesByFile: restWsByFile,
           };
           saveManual(next);
           return next;
@@ -473,6 +753,7 @@ export const usePiDeskStore = create<PiDeskState>()(
               },
             },
           };
+          saveManual(next);
           return next;
         }),
       setInputValue: (v) => set({ inputValue: v }),
@@ -493,8 +774,12 @@ export const usePiDeskStore = create<PiDeskState>()(
           saveUserdata({
             projects: s.projects,
             pinned: s.pinned,
+            archivedSessions: s.archivedSessions,
             sessionNames: s.sessionNames,
             sessionWorkspaces: s.sessionWorkspaces,
+            sessionWorkspacesByFile: s.sessionWorkspacesByFile,
+            sessionUsage: s.sessionUsage,
+            sessionContextUsage: s.sessionContextUsage,
             lastActiveCwd: cwd,
           }).catch(() => {});
           return next;
@@ -510,6 +795,7 @@ export const usePiDeskStore = create<PiDeskState>()(
         settings: s.settings,
         projects: s.projects,
         pinned: s.pinned,
+        archivedSessions: s.archivedSessions,
         language: s.language,
         lastActiveCwd: s.lastActiveCwd,
       }),
@@ -523,6 +809,17 @@ export const usePiDeskStore = create<PiDeskState>()(
           console.warn("[pidesk] Cleaning corrupted defaultModel:", JSON.stringify(dm));
           merged.settings = { ...merged.settings, defaultModel: null };
         }
+        // Thinking-level unification: product decision — ALL models default to
+        // "medium" (Pi global settings.json + PiDesk defaults + role levels).
+        // Override stale stored values (previous defaults were "high" per-role /
+        // the even older "medium"->"high" promotion) so every model lands on
+        // medium, matching the unified thinkingLevelMap (off/low/medium/high/max).
+        merged.settings = {
+          ...merged.settings,
+          defaultThinkingLevel: "medium",
+          roleThinkingLevels: { ...DEFAULT_ROLE_THINKING_LEVELS },
+        };
+        console.log("[pidesk] Unified defaultThinkingLevel + role thinking levels -> medium");
         // Sanitize settings.roleModels — each role's ModelRef must have valid id+provider
         if (merged.settings?.roleModels) {
           const cleaned = { ...merged.settings.roleModels };
@@ -541,6 +838,25 @@ export const usePiDeskStore = create<PiDeskState>()(
         }
         if (merged.sessionUsage == null) merged.sessionUsage = {};
         if (merged.sessionContextUsage == null) merged.sessionContextUsage = {};
+        if (merged.archivedSessions == null || !Array.isArray(merged.archivedSessions)) merged.archivedSessions = [];
+        // Pending queues are runtime state — never restore stale items from storage.
+        merged.pendingQueues = {};
+        // Role-model defaults migration: if every role is unset (fresh install or
+        // old storage), adopt the recommended per-role models so users get
+        // sensible defaults out of the box. Invalid providers are cleaned up
+        // later by refreshModels() in App.tsx.
+        const rm = merged.settings?.roleModels;
+        if (rm) {
+          const allNull = Object.values(rm).every((v) => v == null);
+          if (allNull) {
+            merged.settings = { ...merged.settings, roleModels: DEFAULT_ROLE_MODELS };
+            console.log("[pidesk] Applied recommended per-role model defaults:", DEFAULT_ROLE_MODELS);
+          }
+        }
+        // Role thinking-level defaults migration (new field in old storage)
+        if (merged.settings?.roleThinkingLevels == null) {
+          merged.settings = { ...merged.settings, roleThinkingLevels: DEFAULT_ROLE_THINKING_LEVELS };
+        }
         return merged as PiDeskState;
       },
       onRehydrateStorage: () => undefined, // handled in App.tsx useEffect
@@ -559,8 +875,12 @@ function saveManual(_patch?: Partial<PiDeskState>) {
     saveUserdata({
       projects: s.projects,
       pinned: s.pinned,
+      archivedSessions: s.archivedSessions,
       sessionNames: s.sessionNames,
       sessionWorkspaces: s.sessionWorkspaces,
+      sessionWorkspacesByFile: s.sessionWorkspacesByFile,
+      sessionUsage: s.sessionUsage,
+      sessionContextUsage: s.sessionContextUsage,
       lastActiveCwd: s.lastActiveCwd,
     }).catch(() => {});
   }, 500);

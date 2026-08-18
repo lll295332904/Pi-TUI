@@ -39,3 +39,75 @@ code {
   color: #4f8cff;
   font-weight: bold;
 }
+
+/* Assistant markdown rhythm */
+.assistant-markdown {
+  font-size: 0.875rem;
+  line-height: 1.7;
+}
+.assistant-markdown > :first-child {
+  margin-top: 0;
+}
+.assistant-markdown > :last-child {
+  margin-bottom: 0;
+}
+.assistant-heading {
+  color: #1f2937;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.assistant-heading-1,
+.assistant-heading-2 {
+  margin: 0.95rem 0 0.5rem;
+}
+.assistant-heading-3,
+.assistant-heading-4 {
+  margin: 0.8rem 0 0.4rem;
+}
+.assistant-heading-1 {
+  font-size: 1.05rem;
+}
+.assistant-heading-2 {
+  font-size: 0.98rem;
+}
+.assistant-heading-3,
+.assistant-heading-4 {
+  font-size: 0.92rem;
+}
+.assistant-paragraph {
+  margin: 0.45rem 0;
+}
+.assistant-list {
+  margin: 0.45rem 0;
+  padding-left: 1.25rem;
+}
+.assistant-list-unordered {
+  list-style: disc;
+}
+.assistant-list-ordered {
+  list-style: decimal;
+}
+.assistant-list-item {
+  margin: 0.18rem 0;
+}
+.assistant-code-block {
+  margin: 0.6rem 0;
+  padding: 0.65rem 0.8rem;
+  background: #f7f7f8;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+}
+.assistant-quote {
+  margin: 0.55rem 0;
+  padding-left: 0.75rem;
+  border-left: 3px solid #d1d5db;
+  color: #4b5563;
+}
+.assistant-markdown p + .assistant-heading,
+.assistant-markdown ul + .assistant-heading,
+.assistant-markdown ol + .assistant-heading,
+.assistant-markdown pre + .assistant-heading,
+.assistant-markdown blockquote + .assistant-heading {
+  margin-top: 1rem;
+}

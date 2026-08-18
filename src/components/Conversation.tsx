@@ -1,16 +1,22 @@
 import { useRef, useEffect, useMemo, useState } from "react";
 import { usePiDeskStore } from "../store/pidesk";
 import type { TimelineItem, MessageVM, ToolCallVM } from "../types";
+import { imageToDataUrl } from "../bridge";
 import ReactMarkdown from "react-markdown";
-import remarkBreaks from "remark-breaks";
 import { Wrench, ChevronDown, ChevronRight, Check, X, Loader } from "lucide-react";
 import { useT } from "../i18n";
+
+function normalizeAssistantMarkdown(text: string): string {
+  // Keep one blank line as a paragraph separator, but collapse model-generated spacing.
+  return text.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, "\n\n").trim();
+}
 
 export default function Conversation() {
   const activeId = usePiDeskStore((s) => s.activeSessionId);
   const timeline = usePiDeskStore((s) => (s.activeSessionId ? (s.sessionTimelines[s.activeSessionId] || []) : []));
   const searchQuery = usePiDeskStore((s) => s.searchQuery);
   const availableModels = usePiDeskStore((s) => s.availableModels);
+  const markRequestFirstVisibleRender = usePiDeskStore((s) => s.markRequestFirstVisibleRender);
   const { t } = useT("conversation");
   const ct = useT("common");
 
@@ -18,6 +24,47 @@ export default function Conversation() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const pinnedBottomRef = useRef(true);
   const prevLengthRef = useRef(timeline.length);
+  const prevActiveIdRef = useRef(activeId);
+
+  // 切换会话/恢复会话：重置滚动锚点，直接定位到该会话最新位置（无动画，避免长列表卡顿）
+  useEffect(() => {
+    if (prevActiveIdRef.current !== activeId) {
+      pinnedBottomRef.current = true;
+      prevLengthRef.current = timeline.length;
+      prevActiveIdRef.current = activeId;
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+  }, [activeId, timeline]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const prevLen = prevLengthRef.current;
+    const grew = timeline.length > prevLen;
+    if (grew) {
+      const newItems = timeline.slice(prevLen);
+      const userSent = newItems.some((item) => item.type === "user");
+      if (userSent && timeline.length - prevLen <= 8) {
+        // 用户刚发送新命令/消息：无论当前滚动位置如何，强制滚动到最新位置
+        pinnedBottomRef.current = true;
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      } else if (userSent) {
+        // 大批量载入（历史恢复等）：直接定位到底部，避免长列表 smooth 动画卡顿
+        pinnedBottomRef.current = true;
+        el.scrollTop = el.scrollHeight;
+      } else {
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+        if (nearBottom || pinnedBottomRef.current) {
+          bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+        }
+      }
+    } else if (pinnedBottomRef.current && el.scrollHeight > el.clientHeight) {
+      // 流式输出内容增长（长度不变）：保持跟随最新位置
+      el.scrollTop = el.scrollHeight;
+    }
+    prevLengthRef.current = timeline.length;
+  }, [timeline]);
 
   const visibleTimeline = useMemo(() => {
     if (!searchQuery) return timeline;
@@ -29,17 +76,10 @@ export default function Conversation() {
   }, [timeline, searchQuery]);
 
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const grew = timeline.length > prevLengthRef.current;
-    prevLengthRef.current = timeline.length;
-    if (grew) {
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      if (nearBottom || pinnedBottomRef.current) {
-        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-      }
-    }
-  }, [timeline]);
+    if (!activeId) return;
+    const hasStreamingAssistant = timeline.some((item) => item.type === "assistant" && item.streaming);
+    if (hasStreamingAssistant) markRequestFirstVisibleRender(activeId);
+  }, [activeId, timeline, markRequestFirstVisibleRender]);
 
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -124,7 +164,61 @@ function TimelineRow({ item, t }: { item: TimelineItem; t: (k: string) => string
 }
 
 function UserBubble({ msg }: { msg: MessageVM }) {
-  return <div className="flex justify-end animate-fade-slide"><div className="max-w-[80%] bg-accent text-white rounded-lg px-3 py-2 text-sm"><p className="whitespace-pre-wrap break-words">{msg.text}</p></div></div>;
+  return (
+    <div className="flex justify-end animate-fade-slide">
+      <div className="max-w-[80%] bg-accent text-white rounded-lg px-3 py-2 text-sm">
+        {msg.text && <p className="whitespace-pre-wrap break-words">{msg.text}</p>}
+        {msg.images && msg.images.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-1.5 justify-end">
+            {msg.images.map((img, i) => (
+              <LocalImage key={`${img.path}-${i}`} path={img.path} alt={`attachment ${i + 1}`} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Cache data URLs per image path so re-renders / re-visits don't re-read the file.
+const imageDataUrlCache = new Map<string, string>();
+
+function LocalImage({ path, alt }: { path: string; alt: string }) {
+  const [src, setSrc] = useState<string | null>(() => imageDataUrlCache.get(path) ?? null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (imageDataUrlCache.has(path)) {
+      setSrc(imageDataUrlCache.get(path)!);
+      return;
+    }
+    let cancelled = false;
+    imageToDataUrl(path)
+      .then((url) => {
+        if (cancelled) return;
+        imageDataUrlCache.set(path, url);
+        setSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => { cancelled = true; };
+  }, [path]);
+
+  if (failed) {
+    return <span className="text-[10px] text-white/70 max-w-40 truncate" title={path}>{path.split(/[\\/]/).pop() || "image"}</span>;
+  }
+  if (!src) {
+    return <span className="inline-block h-16 w-24 rounded bg-white/25 animate-pulse" />;
+  }
+  return (
+    <img
+      src={src}
+      alt={alt}
+      className="max-h-40 max-w-56 rounded object-contain border border-white/30 bg-white/10"
+      draggable={false}
+    />
+  );
 }
 
 function AssistantBubble({ msg, t }: { msg: MessageVM; t: (k: string) => string }) {
@@ -144,9 +238,27 @@ function AssistantBubble({ msg, t }: { msg: MessageVM; t: (k: string) => string 
           )}
         </div>
       )}
-      <div className="prose prose-sm max-w-none text-gray-800 whitespace-pre-wrap break-words">
-        {msg.text ? <span className={msg.streaming ? "streaming-cursor" : ""}><ReactMarkdown remarkPlugins={[remarkBreaks]}>{msg.text}</ReactMarkdown></span>
-        : msg.streaming ? <span className="text-muted italic">{t("thinking_")}</span> : null}
+      <div className="assistant-markdown max-w-none text-gray-800 break-words">
+        {msg.text ? (
+          msg.streaming ? (
+            <p className="whitespace-pre-wrap break-words streaming-cursor my-0">{msg.text}</p>
+          ) : (
+            <ReactMarkdown
+              components={{
+                h1: ({ node: _node, ...props }) => <h1 className="assistant-heading assistant-heading-1" {...props} />,
+                h2: ({ node: _node, ...props }) => <h2 className="assistant-heading assistant-heading-2" {...props} />,
+                h3: ({ node: _node, ...props }) => <h3 className="assistant-heading assistant-heading-3" {...props} />,
+                h4: ({ node: _node, ...props }) => <h4 className="assistant-heading assistant-heading-4" {...props} />,
+                p: ({ node: _node, ...props }) => <p className="assistant-paragraph" {...props} />,
+                ul: ({ node: _node, ...props }) => <ul className="assistant-list assistant-list-unordered" {...props} />,
+                ol: ({ node: _node, ...props }) => <ol className="assistant-list assistant-list-ordered" {...props} />,
+                li: ({ node: _node, ...props }) => <li className="assistant-list-item" {...props} />,
+                pre: ({ node: _node, ...props }) => <pre className="assistant-code-block" {...props} />,
+                blockquote: ({ node: _node, ...props }) => <blockquote className="assistant-quote" {...props} />,
+              }}
+            >{normalizeAssistantMarkdown(msg.text)}</ReactMarkdown>
+          )
+        ) : msg.streaming ? <span className="text-muted italic">{t("thinking_")}</span> : null}
       </div>
     </div>
   );

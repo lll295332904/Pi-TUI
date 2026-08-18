@@ -1,3 +1,4 @@
+use crate::commands::images::load_image_parts;
 use crate::error::{AppError, AppErrorDto, AppResult};
 use crate::pi_kernel::PiRequest;
 use crate::AppState;
@@ -20,7 +21,11 @@ pub async fn prompt(
     message: String,
     images: Vec<String>,
 ) -> AppResult<()> {
-    send_cmd!(state, session_id, PiRequest::Prompt { message, images })
+    // Convert image file paths into Pi ImageContent parts (base64 inline data).
+    // Pi rejects raw path strings in the images array, which silently broke
+    // image prompts (empty/malformed user content, no agent activity).
+    let image_parts = load_image_parts(images)?;
+    send_cmd!(state, session_id, PiRequest::Prompt { message, images: image_parts })
 }
 
 #[tauri::command]

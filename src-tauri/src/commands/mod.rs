@@ -6,3 +6,5 @@ pub mod models;
 pub mod pi_files;
 pub mod providers;
 pub mod userdata;
+pub mod clipboard;
+pub mod images;

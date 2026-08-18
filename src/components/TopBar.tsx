@@ -19,7 +19,7 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
   const setInspectorOpen = usePiDeskStore((s) => s.setInspectorOpen);
   const consoleOpen = usePiDeskStore((s) => s.consoleOpen);
   const setConsoleOpen = usePiDeskStore((s) => s.setConsoleOpen);
-  const currentRole = usePiDeskStore((s) => (s.activeSessionId && s.sessionRoles[s.activeSessionId]) || s.globalRole);
+  const currentRole = usePiDeskStore((s) => s.sessionRoles[s.activeSessionId || ""]);
   const availableModels = usePiDeskStore((s) => s.availableModels);
   const modelSwitching = usePiDeskStore((s) => s.modelSwitching);
   const language = usePiDeskStore((s) => s.language);
@@ -77,7 +77,7 @@ export default function TopBar({ onChangeModel, onChangeThinking }: Props) {
               className="flex items-center gap-1 text-xs text-muted hover:text-gray-700 transition-colors bg-gray-100 hover:bg-gray-200 rounded px-1.5 py-0.5 disabled:opacity-60 disabled:cursor-not-allowed"
               title={switching ? t("topbar", "switching") : undefined}
             >
-              {switching ? t("topbar", "switching") : (currentModel ? currentModel.id : "Auto")}
+              {switching ? t("topbar", "switching") : (currentModel ? `${currentModel.provider}/${currentModel.id}` : "Auto")}
               <ChevronDown size={10} className={modelOpen ? "rotate-180" : ""} />
             </button>
             {modelOpen && !switching && (
